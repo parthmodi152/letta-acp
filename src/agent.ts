@@ -2,6 +2,7 @@ import {
   type AgentContext,
   type CancelNotification,
   type ContentBlock,
+  type CreateElicitationResponse,
   type InitializeRequest,
   type InitializeResponse,
   type LoadSessionRequest,
@@ -35,6 +36,7 @@ import {
   type SDKMessage,
   type SDKResultMessage,
 } from "@letta-ai/letta-agent-sdk";
+import { ASK_USER_QUESTION_TOOL, askUserAnswers, askUserForm } from "./ask-user.js";
 import { authMethodsForClient } from "./auth.js";
 import { DEFAULT_ACP_MODEL, type LettaAcpConfig } from "./config.js";
 import {
@@ -53,8 +55,17 @@ import {
   REASONING_EFFORT_CONFIG_ID,
   resolveSelection,
 } from "./model-options.js";
+import { isPlanTool, PlanTracker } from "./plan.js";
 import { withAcpRequestTimeout } from "./request-timeout.js";
 import { SessionRegistry } from "./session-registry.js";
+import {
+  compactionText,
+  parseStreamEvent,
+  retryText,
+  type CompactionSummary,
+  type RetryReport,
+  type UsageReport,
+} from "./stream-events.js";
 import {
   editorReadAutoAllows,
   isSessionModeId,
@@ -125,6 +136,14 @@ interface AcpSessionState {
   currentModelEntryId: string | undefined;
   /** Model settings last reported by updateModel (reasoning_effort, context_window). */
   currentModelSettings: Record<string, unknown> | null | undefined;
+  /** The agent's task list, reported to the client as an ACP plan. */
+  plan: PlanTracker;
+  /** Model cost reported so far in this session, in USD. */
+  costUsd: number;
+  /** Compactions started in this session, for unique compaction ids. */
+  compactions: number;
+  /** The compaction whose summary has not arrived yet. */
+  openCompactionId: string | null;
 }
 
 /** Max history messages replayed on session/load. */
@@ -194,6 +213,12 @@ export class LettaAcpAgent {
     readTextFile: false,
     writeTextFile: false,
   };
+  /** Optional client features that change how updates are reported. */
+  private clientFeatures = {
+    elicitationForm: false,
+    compactionUpdates: false,
+    notices: false,
+  };
 
   constructor(config: LettaAcpConfig) {
     this.config = config;
@@ -233,6 +258,17 @@ export class LettaAcpAgent {
     this.clientFsCaps = {
       readTextFile: fs?.readTextFile === true,
       writeTextFile: fs?.writeTextFile === true,
+    };
+    // `session.compaction` and `session.notices` postdate the pinned ACP SDK
+    // types, so read them off the raw capability object.
+    const sessionCaps = params.clientCapabilities?.session as
+      | Record<string, unknown>
+      | null
+      | undefined;
+    this.clientFeatures = {
+      elicitationForm: params.clientCapabilities?.elicitation?.form != null,
+      compactionUpdates: sessionCaps?.compaction != null,
+      notices: sessionCaps?.notices != null,
     };
     const requested = params.protocolVersion;
     const protocolVersion =
@@ -660,6 +696,10 @@ export class LettaAcpAgent {
       currentModel: bootstrap.model ?? this.config.model,
       currentModelEntryId: undefined,
       currentModelSettings: runtimeModelSettings(session),
+      plan: new PlanTracker(),
+      costUsd: 0,
+      compactions: 0,
+      openCompactionId: null,
     };
     // A client may load the same conversation again while its prior ACP
     // session is still open. Close the displaced SDK session before replacing
@@ -904,6 +944,8 @@ export class LettaAcpAgent {
             }
             return { stopReason: "end_turn" };
           }
+          // /compact reports its summary as ordinary stream events.
+          await this.forwardStreamEvent(sessionId, state, message.event, cx);
           continue;
         }
         if (message.type === "result") {
@@ -1189,6 +1231,19 @@ export class LettaAcpAgent {
             },
           });
         }
+        if (toolCall && !message.isError && isPlanTool(toolCall.toolName)) {
+          const changed = state.plan.apply(
+            toolCall.toolName,
+            toolCall.input.input,
+            rawOutput,
+          );
+          if (changed) {
+            await cx.notify(methods.client.session.update, {
+              sessionId,
+              update: { sessionUpdate: "plan", entries: state.plan.entries() },
+            });
+          }
+        }
         const resultContent = toolResultContent(
           message.toolCallId,
           message.content,
@@ -1225,10 +1280,221 @@ export class LettaAcpAgent {
       case "error":
         log(`stream error: ${message.message}`);
         return false;
+      case "retry":
+        await this.reportRetry(sessionId, cx, {
+          attempt: message.attempt,
+          maxAttempts: message.maxAttempts,
+          delayMs: message.delayMs,
+          reason: message.reason,
+        });
+        return false;
+      case "stream_event":
+        await this.forwardStreamEvent(sessionId, state, message.event, cx);
+        return false;
       default:
-        // queue_update, loop_status, stream_event, retry — no ACP equivalent.
+        // queue_update, loop_status — no ACP equivalent.
         return false;
     }
+  }
+
+  /** Usage, compaction and retry messages the SDK passes through raw. */
+  private async forwardStreamEvent(
+    sessionId: string,
+    state: AcpSessionState,
+    event: unknown,
+    cx: AgentContext,
+  ): Promise<void> {
+    const parsed = parseStreamEvent(event);
+    if (!parsed) return;
+    switch (parsed.kind) {
+      case "usage":
+        await this.reportUsage(sessionId, state, parsed.usage, cx);
+        return;
+      case "retry":
+        await this.reportRetry(sessionId, cx, parsed.retry);
+        return;
+      case "compaction_start":
+        await this.startCompaction(sessionId, state, cx);
+        return;
+      case "compaction_summary":
+        await this.finishCompaction(sessionId, state, parsed, cx);
+        return;
+    }
+  }
+
+  private async reportUsage(
+    sessionId: string,
+    state: AcpSessionState,
+    usage: UsageReport,
+    cx: AgentContext,
+  ): Promise<void> {
+    if (usage.costUsd !== undefined) state.costUsd += usage.costUsd;
+    const size = contextWindowSize(state);
+    await cx.notify(methods.client.session.update, {
+      sessionId,
+      update: {
+        sessionUpdate: "usage_update",
+        used: Math.round(usage.contextTokens),
+        size: size ?? 0,
+        ...(state.costUsd > 0
+          ? { cost: { amount: state.costUsd, currency: "USD" } }
+          : {}),
+      },
+    });
+  }
+
+  /**
+   * Retries are transient, so they go out as notices when the client shows
+   * them. Otherwise they appear as a line of the agent's thinking, which keeps
+   * the user from staring at a silent turn.
+   */
+  private async reportRetry(
+    sessionId: string,
+    cx: AgentContext,
+    retry: RetryReport,
+  ): Promise<void> {
+    const text = retryText(retry);
+    log(text);
+    const update = this.clientFeatures.notices
+      ? {
+          sessionUpdate: "notice",
+          severity: "warning",
+          title: text,
+        }
+      : {
+          sessionUpdate: "agent_thought_chunk" as const,
+          content: { type: "text" as const, text: `\n${text}\n` },
+        };
+    await cx.notify(methods.client.session.update, {
+      sessionId,
+      update: update as never,
+    });
+  }
+
+  private async startCompaction(
+    sessionId: string,
+    state: AcpSessionState,
+    cx: AgentContext,
+  ): Promise<string> {
+    const id = `compaction-${++state.compactions}`;
+    state.openCompactionId = id;
+    await cx.notify(methods.client.session.update, {
+      sessionId,
+      update: this.clientFeatures.compactionUpdates
+        ? ({
+            sessionUpdate: "compaction_update",
+            compactionId: id,
+            status: "in_progress",
+          } as never)
+        : {
+            sessionUpdate: "tool_call",
+            toolCallId: id,
+            title: "Compact context",
+            kind: "think",
+            status: "in_progress",
+          },
+    });
+    return id;
+  }
+
+  private async finishCompaction(
+    sessionId: string,
+    state: AcpSessionState,
+    summary: CompactionSummary,
+    cx: AgentContext,
+  ): Promise<void> {
+    // Some servers send the summary without announcing the compaction first.
+    const id =
+      state.openCompactionId ?? (await this.startCompaction(sessionId, state, cx));
+    state.openCompactionId = null;
+    const text = compactionText(summary);
+    await cx.notify(methods.client.session.update, {
+      sessionId,
+      update: this.clientFeatures.compactionUpdates
+        ? ({
+            sessionUpdate: "compaction_update",
+            compactionId: id,
+            status: "completed",
+            ...(text ? { summary: [{ type: "text", text }] } : {}),
+          } as never)
+        : {
+            sessionUpdate: "tool_call_update",
+            toolCallId: id,
+            status: "completed",
+            ...(text
+              ? {
+                  content: [
+                    { type: "content" as const, content: { type: "text" as const, text } },
+                  ],
+                }
+              : {}),
+          },
+    });
+  }
+
+  /**
+   * AskUserQuestion carries its answers back in the approval. Clients with
+   * form elicitation show the questions as a form; others get a denial that
+   * tells the model to ask in an ordinary message instead.
+   */
+  private async askUserQuestion(
+    sessionId: string,
+    state: AcpSessionState,
+    cx: AgentContext,
+    toolInput: Record<string, unknown>,
+    toolCallId: string | undefined,
+  ): Promise<CanUseToolResponse> {
+    const form = askUserForm(toolInput);
+    if (!this.clientFeatures.elicitationForm || !form) {
+      log("AskUserQuestion: client has no form elicitation; asking in chat instead");
+      return {
+        behavior: "deny",
+        message:
+          "AskUserQuestion is not available in this client. Ask the same questions in an ordinary message and wait for the user's reply.",
+      };
+    }
+    const params = {
+      sessionId,
+      ...(toolCallId ? { toolCallId } : {}),
+      mode: "form" as const,
+      message: form.message,
+      requestedSchema: form.requestedSchema,
+    };
+    let response: unknown;
+    try {
+      response = state.promptActive
+        ? await cx.request(methods.client.elicitation.create, params)
+        : await withAcpRequestTimeout(
+            (signal) =>
+              cx.request(methods.client.elicitation.create, params, {
+                cancellationSignal: signal,
+              }),
+            {
+              label: "Question",
+              description: "answer the agent's questions outside a prompt turn",
+              timeoutMs: this.outOfTurnPermissionTimeoutMs,
+            },
+          );
+    } catch (error) {
+      log(`AskUserQuestion elicitation failed: ${String(error)}`);
+      return {
+        behavior: "deny",
+        message: error instanceof Error ? error.message : String(error),
+        interrupt: true,
+      };
+    }
+    const outcome = askUserAnswers(form, response as CreateElicitationResponse);
+    if (outcome.kind === "declined") {
+      return { behavior: "deny", message: outcome.message };
+    }
+    const previous =
+      toolInput.answers && typeof toolInput.answers === "object"
+        ? (toolInput.answers as Record<string, unknown>)
+        : {};
+    return {
+      behavior: "allow",
+      updatedInput: { ...toolInput, answers: { ...previous, ...outcome.answers } },
+    };
   }
 
   private toPromptResponse(
@@ -1301,6 +1567,16 @@ export class LettaAcpAgent {
     toolInput: Record<string, unknown>,
     context: CanUseToolContext | undefined,
   ): Promise<CanUseToolResponse> {
+    // Questions need the user's answers, so no permission mode skips them.
+    if (toolName === ASK_USER_QUESTION_TOOL) {
+      return this.askUserQuestion(
+        sessionId,
+        state,
+        cx,
+        toolInput,
+        context?.toolCallId,
+      );
+    }
     const workspaceEditorRead = await editorReadAutoAllows(
       state.modeId,
       toolName,
@@ -1478,6 +1754,13 @@ function runtimeModelSettings(
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : undefined;
+}
+
+/** Context window of the session's current model, when known. */
+function contextWindowSize(state: AcpSessionState): number | undefined {
+  const value = (state.currentModelSettings ?? runtimeModelSettings(state.session))
+    ?.context_window;
+  return typeof value === "number" && value > 0 ? value : undefined;
 }
 
 function sessionTitle(conversation: LettaConversation): string | undefined {

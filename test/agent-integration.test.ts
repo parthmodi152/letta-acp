@@ -3,7 +3,10 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentContext, McpServer } from "@agentclientprotocol/sdk";
-import type { LettaCodeSocketConstructor } from "@letta-ai/letta-agent-sdk";
+import type {
+  LettaCodeSocketConstructor,
+  PermissionMode,
+} from "@letta-ai/letta-agent-sdk";
 import { LettaAcpAgent, toSdkMcpServers } from "../src/agent.js";
 import { SessionRegistry } from "../src/session-registry.js";
 
@@ -38,6 +41,10 @@ class FakeAppServer {
   private cancelablePromptActive = false;
   private cancelableRunId: string | null = null;
   private replacementRuns = 0;
+  private readonly scripts = new Map<
+    string,
+    { runId: string; deltas: WireMessage[]; afterStop: WireMessage[] }
+  >();
   private abortSettling = false;
 
   socketConstructor(): LettaCodeSocketConstructor {
@@ -93,6 +100,20 @@ class FakeAppServer {
     }
 
     return FakeSocket as unknown as LettaCodeSocketConstructor;
+  }
+
+  /**
+   * Answers a prompt containing `trigger` with these stream deltas, then ends
+   * the turn. `afterStop` deltas go between stop_reason and turn_finished,
+   * where Letta sends usage_statistics.
+   */
+  script(
+    trigger: string,
+    runId: string,
+    deltas: WireMessage[],
+    afterStop: WireMessage[] = [],
+  ): void {
+    this.scripts.set(trigger, { runId, deltas, afterStop });
   }
 
   /** Resolves with the next approval_response the adapter sends back. */
@@ -452,6 +473,27 @@ class FakeAppServer {
       this.finishTurn(socket, runtime, runId, "end_turn");
       return;
     }
+    for (const [trigger, script] of this.scripts) {
+      if (!promptText.includes(trigger)) continue;
+      for (const delta of script.deltas) {
+        this.pushDelta(socket, runtime, { run_id: script.runId, ...delta });
+      }
+      this.pushDelta(socket, runtime, {
+        message_type: "stop_reason",
+        run_id: script.runId,
+        stop_reason: "end_turn",
+      });
+      for (const delta of script.afterStop) {
+        this.pushDelta(socket, runtime, { run_id: script.runId, ...delta });
+      }
+      socket.push({
+        type: "turn_finished",
+        runtime,
+        run_id: script.runId,
+        stop_reason: "end_turn",
+      });
+      return;
+    }
     if (promptText.includes("fragmented prompt")) {
       this.streamFragmentedToolCall(socket, runtime);
       return;
@@ -719,6 +761,7 @@ function createAgent(
     prematureResultGraceMs?: number;
     permissionSelector?: boolean;
     cancelDrainMs?: number;
+    permissionMode?: PermissionMode;
   } = {},
 ): LettaAcpAgent {
   return new LettaAcpAgent({
@@ -742,6 +785,7 @@ function createContext(
     answerPermissions?: boolean;
     permissionDelayMs?: number;
     permissionOptionId?: "allow_once" | "allow_always" | "reject_once";
+    elicitationResponse?: WireMessage;
   } = {},
 ) {
   const answerPermissions = options.answerPermissions ?? true;
@@ -750,15 +794,20 @@ function createContext(
   const updates: WireMessage[] = [];
   const permissionRequests: WireMessage[] = [];
   const permissionSignals: Array<AbortSignal | undefined> = [];
+  const elicitationRequests: WireMessage[] = [];
   const context = {
     notify: async (_method: unknown, params: { update: WireMessage }) => {
       updates.push(params.update);
     },
     request: async (
-      _method: unknown,
+      method: unknown,
       params: WireMessage,
       requestOptions?: { cancellationSignal?: AbortSignal },
     ) => {
+      if (method === "elicitation/create") {
+        elicitationRequests.push(params);
+        return options.elicitationResponse ?? { action: "cancel" };
+      }
       permissionRequests.push(params);
       permissionSignals.push(requestOptions?.cancellationSignal);
       if (!answerPermissions) return new Promise(() => {});
@@ -770,15 +819,22 @@ function createContext(
       };
     },
   } as unknown as AgentContext;
-  return { context, updates, permissionRequests, permissionSignals };
+  return {
+    context,
+    updates,
+    permissionRequests,
+    permissionSignals,
+    elicitationRequests,
+  };
 }
 
 async function openSession(
   agent: LettaAcpAgent,
   context: AgentContext,
   cwd = "/tmp/letta-acp-test",
+  clientCapabilities: Record<string, unknown> = {},
 ) {
-  await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+  await agent.initialize({ protocolVersion: 1, clientCapabilities });
   return agent.newSession({ cwd, mcpServers: [] }, context);
 }
 
@@ -1521,6 +1577,273 @@ describe("Agent SDK app-server integration", () => {
       );
       // Out-of-turn requests carry a deadline the client can observe.
       expect(permissionSignals.at(-1)).toBeInstanceOf(AbortSignal);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("reports the task list as an ACP plan", async () => {
+    const server = new FakeAppServer();
+    server.script("plan prompt", "run-plan", [
+      {
+        message_type: "tool_call_message",
+        tool_calls: [
+          { id: "call-create", name: "TaskCreate", arguments: JSON.stringify({ subject: "Run tests" }) },
+        ],
+      },
+      {
+        message_type: "tool_return_message",
+        tool_call_id: "call-create",
+        tool_return: JSON.stringify({ taskId: "task_1", subject: "Run tests", status: "pending" }),
+        status: "success",
+      },
+      {
+        message_type: "tool_call_message",
+        tool_calls: [
+          {
+            id: "call-update",
+            name: "TaskUpdate",
+            arguments: JSON.stringify({ taskId: "task_1", status: "completed" }),
+          },
+        ],
+      },
+      {
+        message_type: "tool_return_message",
+        tool_call_id: "call-update",
+        tool_return: JSON.stringify({ taskId: "task_1", subject: "Run tests", status: "completed" }),
+        status: "success",
+      },
+    ]);
+    const agent = createAgent(server);
+    const { context, updates } = createContext();
+
+    try {
+      const session = await openSession(agent, context);
+      await agent.prompt(
+        { sessionId: session.sessionId, prompt: [{ type: "text", text: "plan prompt" }] },
+        context,
+      );
+      expect(updates.filter((update) => update.sessionUpdate === "plan")).toEqual([
+        {
+          sessionUpdate: "plan",
+          entries: [{ content: "Run tests", priority: "medium", status: "pending" }],
+        },
+        {
+          sessionUpdate: "plan",
+          entries: [{ content: "Run tests", priority: "medium", status: "completed" }],
+        },
+      ]);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("reports context usage, cumulative cost, compaction and retries", async () => {
+    const server = new FakeAppServer();
+    server.script(
+      "usage prompt",
+      "run-usage",
+      [
+        {
+          message_type: "event_message",
+          event_type: "retry",
+          event_data: { attempt: 1, max_attempts: 3, delay_ms: 2000, message: "overloaded" },
+        },
+        {
+          message_type: "event_message",
+          event_type: "compaction",
+          event_data: { trigger: "context_window_limit" },
+        },
+        {
+          message_type: "summary_message",
+          summary: "Earlier work summarized.",
+          compaction_stats: { context_tokens_before: 90_000, context_tokens_after: 8_000 },
+        },
+        { message_type: "assistant_message", content: "USAGE_OK" },
+        { message_type: "usage_statistics", context_tokens: 8_500, api_cost_usd: 0.01 },
+      ],
+      [{ message_type: "usage_statistics", context_tokens: 9_000, api_cost_usd: 0.02 }],
+    );
+    const agent = createAgent(server);
+    const { context, updates } = createContext();
+
+    try {
+      const session = await openSession(agent, context);
+      await agent.prompt(
+        { sessionId: session.sessionId, prompt: [{ type: "text", text: "usage prompt" }] },
+        context,
+      );
+      const usage = updates.filter((update) => update.sessionUpdate === "usage_update");
+      expect(usage.map((update) => update.used)).toEqual([8_500, 9_000]);
+      expect((usage.at(-1)?.cost as { amount: number }).amount).toBeCloseTo(0.03);
+      expect(
+        updates.find((update) => update.sessionUpdate === "agent_thought_chunk"),
+      ).toEqual({
+        sessionUpdate: "agent_thought_chunk",
+        content: {
+          type: "text",
+          text: "\nRetrying model request (1 of 3) in 2s: overloaded\n",
+        },
+      });
+      // Without the session.compaction capability, compaction is a tool card.
+      const compaction = updates.filter(
+        (update) => update.toolCallId === "compaction-1",
+      );
+      expect(compaction).toEqual([
+        {
+          sessionUpdate: "tool_call",
+          toolCallId: "compaction-1",
+          title: "Compact context",
+          kind: "think",
+          status: "in_progress",
+        },
+        {
+          sessionUpdate: "tool_call_update",
+          toolCallId: "compaction-1",
+          status: "completed",
+          content: [
+            {
+              type: "content",
+              content: {
+                type: "text",
+                text: "Context 90k → 8k tokens.\n\nEarlier work summarized.",
+              },
+            },
+          ],
+        },
+      ]);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("uses native compaction updates and notices when the client has them", async () => {
+    const server = new FakeAppServer();
+    server.script("native compaction prompt", "run-native", [
+      {
+        message_type: "event_message",
+        event_type: "retry",
+        event_data: { attempt: 2, max_attempts: 3, delay_ms: 500 },
+      },
+      { message_type: "summary_message", summary: "Short." },
+    ]);
+    const agent = createAgent(server);
+    const { context, updates } = createContext();
+
+    try {
+      const session = await openSession(agent, context, undefined, {
+        session: { compaction: {}, notices: {} },
+      });
+      await agent.prompt(
+        {
+          sessionId: session.sessionId,
+          prompt: [{ type: "text", text: "native compaction prompt" }],
+        },
+        context,
+      );
+      expect(updates).toContainEqual({
+        sessionUpdate: "notice",
+        severity: "warning",
+        title: "Retrying model request (2 of 3) in 0.5s",
+      });
+      expect(
+        updates.filter((update) => update.sessionUpdate === "compaction_update"),
+      ).toEqual([
+        { sessionUpdate: "compaction_update", compactionId: "compaction-1", status: "in_progress" },
+        {
+          sessionUpdate: "compaction_update",
+          compactionId: "compaction-1",
+          status: "completed",
+          summary: [{ type: "text", text: "Short." }],
+        },
+      ]);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("asks AskUserQuestion as a form and returns the answers", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, { permissionMode: "unrestricted" });
+    const { context, permissionRequests, elicitationRequests } = createContext({
+      elicitationResponse: { action: "accept", content: { q1: "luxon" } },
+    });
+    const question = {
+      question: "Which library should we use?",
+      header: "Library",
+      options: [
+        { label: "date-fns", description: "Small" },
+        { label: "luxon", description: "Time zones" },
+      ],
+    };
+
+    try {
+      const session = await openSession(agent, context, undefined, {
+        elicitation: { form: {} },
+      });
+      await agent.prompt(
+        { sessionId: session.sessionId, prompt: [{ type: "text", text: "plain prompt" }] },
+        context,
+      );
+      const approval = server.nextApprovalResponse();
+      server.requestPermissionAfterPrompt({
+        requestId: "ask-request",
+        toolName: "AskUserQuestion",
+        toolCallId: "call-ask",
+        input: { questions: [question] },
+      });
+
+      expect(await approval).toEqual(
+        expect.objectContaining({
+          request_id: "ask-request",
+          decision: expect.objectContaining({
+            behavior: "allow",
+            updated_input: {
+              questions: [question],
+              answers: { "Which library should we use?": "luxon" },
+            },
+          }),
+        }),
+      );
+      expect(permissionRequests).toEqual([]);
+      expect(elicitationRequests).toEqual([
+        expect.objectContaining({
+          sessionId: session.sessionId,
+          toolCallId: "call-ask",
+          mode: "form",
+          message: "Which library should we use?",
+        }),
+      ]);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("tells the model to ask in chat when the client has no forms", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const { context, permissionRequests, elicitationRequests } = createContext();
+
+    try {
+      const session = await openSession(agent, context);
+      await agent.prompt(
+        { sessionId: session.sessionId, prompt: [{ type: "text", text: "plain prompt" }] },
+        context,
+      );
+      const approval = server.nextApprovalResponse();
+      server.requestPermissionAfterPrompt({
+        requestId: "ask-request",
+        toolName: "AskUserQuestion",
+        toolCallId: "call-ask",
+        input: { questions: [{ question: "Proceed?", header: "Go", options: [] }] },
+      });
+      expect(await approval).toEqual(
+        expect.objectContaining({
+          decision: expect.objectContaining({ behavior: "deny" }),
+        }),
+      );
+      expect(permissionRequests).toEqual([]);
+      expect(elicitationRequests).toEqual([]);
     } finally {
       agent.shutdown();
     }
