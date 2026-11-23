@@ -378,6 +378,13 @@ class FakeAppServer {
     }
 
     const promptText = JSON.stringify(payload.messages);
+    if (promptText.includes("silent prompt to cancel")) {
+      // Accept the turn but emit nothing, as when a steer cancels a turn
+      // before the model has produced its first event.
+      this.cancelablePromptActive = true;
+      for (const waiter of this.cancelablePromptWaiters.splice(0)) waiter();
+      return;
+    }
     if (promptText.includes("cancel active prompt")) {
       this.cancelablePromptActive = true;
       for (const waiter of this.cancelablePromptWaiters.splice(0)) waiter();
@@ -637,6 +644,21 @@ class FakeAppServer {
       run_id: runId,
       stop_reason: stopReason,
     });
+  }
+}
+
+/** Fails instead of hanging when a prompt never settles. */
+async function raceTimeout<T>(pending: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      pending,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -1852,6 +1874,48 @@ describe("Agent SDK app-server integration", () => {
           prompt: [{ type: "text", text: "replacement after cancel" }],
         },
         context,
+      );
+
+      expect(replacement).toEqual({ stopReason: "end_turn" });
+      expect(updates.slice(replacementUpdateStart)).toContainEqual({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "REPLACEMENT_OK" },
+      });
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("a replacement prompt gets its own turn after an early cancel", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const { context, updates } = createContext();
+
+    try {
+      const session = await openSession(agent, context);
+      const started = server.nextCancelablePrompt();
+      const first = agent.prompt(
+        {
+          sessionId: session.sessionId,
+          prompt: [{ type: "text", text: "silent prompt to cancel" }],
+        },
+        context,
+      );
+      await started;
+      // Steering: the client cancels, then immediately sends the new prompt.
+      await agent.cancel({ sessionId: session.sessionId });
+      expect(await first).toEqual({ stopReason: "cancelled" });
+
+      const replacementUpdateStart = updates.length;
+      const replacement = await raceTimeout(
+        agent.prompt(
+          {
+            sessionId: session.sessionId,
+            prompt: [{ type: "text", text: "replacement after cancel" }],
+          },
+          context,
+        ),
+        3000,
       );
 
       expect(replacement).toEqual({ stopReason: "end_turn" });
