@@ -142,6 +142,10 @@ interface AcpSessionState {
   compactions: number;
   /** The compaction whose summary has not arrived yet. */
   openCompactionId: string | null;
+  /** Context window the server last reported for this conversation. */
+  reportedContextWindow: number | undefined;
+  /** Catalog context window, looked up once per model. */
+  catalogContextWindow: { model: string; size: number | undefined } | null;
 }
 
 /** Max history messages replayed on session/load. */
@@ -535,6 +539,8 @@ export class LettaAcpAgent {
     if (result.modelSettings !== undefined) {
       state.currentModelSettings = result.modelSettings;
     }
+    // A different model has its own window; wait for the server to report it.
+    state.reportedContextWindow = undefined;
   }
 
   async setSessionConfigOption(
@@ -696,6 +702,8 @@ export class LettaAcpAgent {
       costUsd: 0,
       compactions: 0,
       openCompactionId: null,
+      catalogContextWindow: null,
+      reportedContextWindow: undefined,
     };
     // A client may load the same conversation again while its prior ACP
     // session is still open. Close the displaced SDK session before replacing
@@ -812,6 +820,9 @@ export class LettaAcpAgent {
       if (state.cancelled) return { stopReason: "cancelled" };
       throw error;
     } finally {
+      await this.settleCompaction(params.sessionId, state, cx).catch((error: unknown) => {
+        log(`could not close the compaction card: ${String(error)}`);
+      });
       // The client context stays for the lifetime of the session; only the
       // in-a-turn marker is cleared, so late tool traffic still reaches the
       // client but waits on a deadline.
@@ -918,6 +929,7 @@ export class LettaAcpAgent {
       if (state.cancelled) return { stopReason: "cancelled" };
       for await (const message of state.session.stream()) {
         if (state.cancelled) return { stopReason: "cancelled" };
+        if (TRACE) log(`trace ${sessionId} command ${describeSdkMessage(message)}`);
         if (message.type === "stream_event") {
           const event = message.event as Record<string, unknown>;
           if (
@@ -1119,6 +1131,16 @@ export class LettaAcpAgent {
     message: SDKMessage,
     cx: AgentContext,
   ): Promise<boolean> {
+    if (
+      state.openCompactionId &&
+      (message.type === "assistant" ||
+        message.type === "reasoning" ||
+        message.type === "tool_call")
+    ) {
+      // Letta Cloud announces a compaction but does not stream its summary;
+      // the model speaking again means it is done.
+      await this.settleCompaction(sessionId, state, cx);
+    }
     switch (message.type) {
       case "init":
         log(`turn started (agent ${message.agentId}, model ${message.model})`);
@@ -1310,6 +1332,7 @@ export class LettaAcpAgent {
         await this.reportRetry(sessionId, cx, parsed.retry);
         return;
       case "compaction_start":
+        if (parsed.contextWindow) state.reportedContextWindow = parsed.contextWindow;
         await this.startCompaction(sessionId, state, cx);
         return;
       case "compaction_summary":
@@ -1325,7 +1348,10 @@ export class LettaAcpAgent {
     cx: AgentContext,
   ): Promise<void> {
     if (usage.costUsd !== undefined) state.costUsd += usage.costUsd;
-    const size = contextWindowSize(state);
+    const size =
+      state.reportedContextWindow ??
+      contextWindowSize(state) ??
+      (await this.catalogContextWindow(state));
     await cx.notify(methods.client.session.update, {
       sessionId,
       update: {
@@ -1337,6 +1363,27 @@ export class LettaAcpAgent {
           : {}),
       },
     });
+  }
+
+  /**
+   * The runtime reports the context window only after a model change, so a
+   * session on its starting model takes it from the model catalog.
+   */
+  private async catalogContextWindow(
+    state: AcpSessionState,
+  ): Promise<number | undefined> {
+    const model = `${state.currentModelEntryId ?? ""}\u0000${state.currentModel ?? ""}`;
+    if (state.catalogContextWindow?.model === model) {
+      return state.catalogContextWindow.size;
+    }
+    let size: number | undefined;
+    try {
+      size = (await this.modelView(state)).selection?.group.contextWindow;
+    } catch (error) {
+      log(`cannot read the model catalog for the context window: ${String(error)}`);
+    }
+    state.catalogContextWindow = { model, size };
+    return size;
   }
 
   /**
@@ -1391,6 +1438,21 @@ export class LettaAcpAgent {
           },
     });
     return id;
+  }
+
+  /** Closes a compaction whose summary never arrived. */
+  private async settleCompaction(
+    sessionId: string,
+    state: AcpSessionState,
+    cx: AgentContext,
+  ): Promise<void> {
+    if (!state.openCompactionId) return;
+    await this.finishCompaction(
+      sessionId,
+      state,
+      { kind: "compaction_summary", summary: "Older messages were summarized to free up context." },
+      cx,
+    );
   }
 
   private async finishCompaction(
@@ -1659,6 +1721,12 @@ function describeSdkMessage(message: SDKMessage): string {
   const fields = ["type", "messageType", "status", "success", "stopReason", "errorCode", "error", "origin", "runIds", "activeRunIds", "runId"]
     .filter((key) => record[key] !== undefined)
     .map((key) => `${key}=${JSON.stringify(record[key])}`);
+  const event = record.event as Record<string, unknown> | undefined;
+  if (message.type === "stream_event" && event) {
+    for (const key of ["message_type", "event_type", "event_data"]) {
+      if (event[key] !== undefined) fields.push(`event.${key}=${JSON.stringify(event[key])}`);
+    }
+  }
   return fields.join(" ").slice(0, 400);
 }
 

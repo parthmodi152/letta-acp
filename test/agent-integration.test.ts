@@ -1640,7 +1640,7 @@ describe("Agent SDK app-server integration", () => {
         {
           message_type: "event_message",
           event_type: "compaction",
-          event_data: { trigger: "context_window_limit" },
+          event_data: { trigger: "context_window_limit", context_window: 40_000 },
         },
         {
           message_type: "summary_message",
@@ -1663,6 +1663,8 @@ describe("Agent SDK app-server integration", () => {
       );
       const usage = updates.filter((update) => update.sessionUpdate === "usage_update");
       expect(usage.map((update) => update.used)).toEqual([8_500, 9_000]);
+      // The window the server reported with the compaction wins over the catalog's.
+      expect(usage.map((update) => update.size)).toEqual([40_000, 40_000]);
       expect((usage.at(-1)?.cost as { amount: number }).amount).toBeCloseTo(0.03);
       expect(
         updates.find((update) => update.sessionUpdate === "agent_thought_chunk"),
@@ -1700,6 +1702,43 @@ describe("Agent SDK app-server integration", () => {
           ],
         },
       ]);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("closes a compaction card when the server sends no summary", async () => {
+    const server = new FakeAppServer();
+    server.script("silent compaction prompt", "run-silent-compaction", [
+      {
+        message_type: "event_message",
+        event_type: "compaction",
+        event_data: { trigger: "context_window_limit" },
+      },
+      { message_type: "assistant_message", content: "AFTER_COMPACTION" },
+    ]);
+    const agent = createAgent(server);
+    const { context, updates } = createContext();
+
+    try {
+      const session = await openSession(agent, context);
+      await agent.prompt(
+        {
+          sessionId: session.sessionId,
+          prompt: [{ type: "text", text: "silent compaction prompt" }],
+        },
+        context,
+      );
+      const compaction = updates.filter((update) => update.toolCallId === "compaction-1");
+      expect(compaction.map((update) => update.status)).toEqual(["in_progress", "completed"]);
+      // The card closes before the reply that follows it.
+      const closed = updates.findIndex(
+        (update) => update.toolCallId === "compaction-1" && update.status === "completed",
+      );
+      const reply = updates.findIndex(
+        (update) => update.sessionUpdate === "agent_message_chunk",
+      );
+      expect(closed).toBeLessThan(reply);
     } finally {
       agent.shutdown();
     }

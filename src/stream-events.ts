@@ -13,6 +13,8 @@ export interface UsageReport {
 export interface CompactionStart {
   kind: "compaction_start";
   trigger?: string;
+  /** The conversation's effective context window, which /context-limit can lower. */
+  contextWindow?: number;
 }
 
 export interface CompactionSummary {
@@ -56,7 +58,12 @@ export function parseStreamEvent(event: unknown): LettaStreamEvent | null {
       const data = record(raw.event_data);
       if (raw.event_type === "compaction") {
         const trigger = typeof data?.trigger === "string" ? data.trigger : undefined;
-        return { kind: "compaction_start", ...(trigger ? { trigger } : {}) };
+        const contextWindow = number(data?.context_window);
+        return {
+          kind: "compaction_start",
+          ...(trigger ? { trigger } : {}),
+          ...(contextWindow ? { contextWindow } : {}),
+        };
       }
       if (raw.event_type === "retry" && data) {
         return {
