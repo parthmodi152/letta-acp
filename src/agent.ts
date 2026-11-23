@@ -472,6 +472,23 @@ export class LettaAcpAgent {
   async setSessionConfigOption(
     params: SetSessionConfigOptionRequest,
   ): Promise<SetSessionConfigOptionResponse> {
+    const started = Date.now();
+    log(
+      `session ${params.sessionId} set ${params.configId} = ${String(params.value)}`,
+    );
+    try {
+      return await this.applySessionConfigOption(params);
+    } catch (error) {
+      log(
+        `session ${params.sessionId} set ${params.configId} failed after ${Date.now() - started}ms: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      throw error;
+    }
+  }
+
+  private async applySessionConfigOption(
+    params: SetSessionConfigOptionRequest,
+  ): Promise<SetSessionConfigOptionResponse> {
     const state = this.sessions.get(params.sessionId);
     if (!state) {
       throw new Error(`Unknown session: ${params.sessionId}`);
