@@ -42,6 +42,15 @@ import {
   type EditorFsCapabilities,
 } from "./editor-tools.js";
 import { historyToUpdates } from "./history-replay.js";
+import {
+  buildModelCatalog,
+  entryForChoice,
+  isReasoningEffort,
+  MODEL_CONFIG_ID,
+  modelConfigOptions,
+  REASONING_EFFORT_CONFIG_ID,
+  resolveSelection,
+} from "./model-options.js";
 import { withAcpRequestTimeout } from "./request-timeout.js";
 import { SessionRegistry } from "./session-registry.js";
 import {
@@ -98,6 +107,10 @@ interface AcpSessionState {
   cwd: string;
   /** Model handle reported by the runtime, updated after ACP model changes. */
   currentModel: string | undefined;
+  /** Catalog entry id last applied through updateModel (pins model + effort). */
+  currentModelEntryId: string | undefined;
+  /** Model settings last reported by updateModel (reasoning_effort, context_window). */
+  currentModelSettings: Record<string, unknown> | null | undefined;
 }
 
 /** Max history messages replayed on session/load. */
@@ -353,43 +366,69 @@ export class LettaAcpAgent {
     state: AcpSessionState,
   ): Promise<SessionConfigOption[]> {
     const { entries } = await state.session.listModels();
-    const models = [...new Map(entries.map((entry) => [entry.id, entry])).values()];
-    const selected = models.find(
-      (entry) =>
-        entry.id === state.currentModel || entry.handle === state.currentModel,
-    );
-    let currentValue =
-      selected?.id ??
-      models.find((entry) => entry.isDefault)?.id ??
-      models[0]?.id;
-    const options = models.map((entry) => ({
-      value: entry.id,
-      name: entry.label,
-      ...(entry.description ? { description: entry.description } : {}),
-    }));
-
+    const catalog = buildModelCatalog(entries);
+    const selection = resolveSelection(catalog, {
+      entryId: state.currentModelEntryId,
+      model: state.currentModel,
+      settings: state.currentModelSettings,
+    });
     // A custom model handle may be active even when it is not in the curated
-    // catalog. ACP requires currentValue to identify one of the options, so
-    // retain that model rather than falsely presenting a different selection.
-    if (!selected && state.currentModel) {
-      currentValue = state.currentModel;
-      options.unshift({ value: state.currentModel, name: state.currentModel });
-    }
-    const configOptions: SessionConfigOption[] = [
+    // catalog; modelConfigOptions keeps it as the current value rather than
+    // falsely presenting a different selection.
+    return [
       permissionModeConfigOption(state.modeId),
+      ...modelConfigOptions(catalog, selection, state.currentModel),
     ];
-    if (currentValue) {
-      configOptions.push({
-        id: "model",
-        name: "Model",
-        description: "Model used for this Letta session",
-        category: "model",
-        type: "select",
-        currentValue,
-        options,
-      });
+  }
+
+  /**
+   * Applies a model/effort choice. Either argument may be omitted to keep the
+   * session's current value; the pair resolves to one catalog entry id.
+   */
+  private async applyModelChoice(
+    state: AcpSessionState,
+    choice: { model?: string; effort?: string },
+  ): Promise<void> {
+    const { entries } = await state.session.listModels();
+    const catalog = buildModelCatalog(entries);
+    const current = resolveSelection(catalog, {
+      entryId: state.currentModelEntryId,
+      model: state.currentModel,
+      settings: state.currentModelSettings,
+    });
+    const groupValue = choice.model ?? current?.group.value;
+    if (!groupValue) {
+      throw new Error("No current model to apply a reasoning effort to");
     }
-    return configOptions;
+    if (choice.effort !== undefined) {
+      const group = catalog.groupByEntryId.get(groupValue);
+      const offered =
+        isReasoningEffort(choice.effort) &&
+        group?.tiers.some((tier) => tier.effort === choice.effort);
+      if (!offered) {
+        throw new Error(
+          `${group?.label ?? groupValue} has no ${choice.effort} reasoning effort`,
+        );
+      }
+    }
+    // A new model keeps the current effort when it offers that tier.
+    const effort = choice.effort ?? current?.effort;
+    const entryId = entryForChoice(
+      catalog,
+      groupValue,
+      isReasoningEffort(effort) ? effort : undefined,
+    );
+    // Not a catalog group: a custom handle passed straight through.
+    await this.applyModel(state, entryId ?? groupValue);
+  }
+
+  private async applyModel(state: AcpSessionState, model: string): Promise<void> {
+    const result = await state.session.updateModel(model);
+    state.currentModel = result.modelHandle ?? result.modelId ?? model;
+    state.currentModelEntryId = result.modelId ?? model;
+    if (result.modelSettings !== undefined) {
+      state.currentModelSettings = result.modelSettings;
+    }
   }
 
   async setSessionConfigOption(
@@ -407,13 +446,24 @@ export class LettaAcpAgent {
       log(`session ${params.sessionId} mode -> ${params.value}`);
       return { configOptions: await this.sessionConfigOptions(state) };
     }
-    if (params.configId === "model") {
+    if (params.configId === MODEL_CONFIG_ID) {
       if (typeof params.value !== "string") {
         throw new Error("The model configuration option requires a model id");
       }
-      const result = await state.session.updateModel(params.value);
-      state.currentModel = result.modelHandle ?? result.modelId ?? params.value;
-      log(`session ${params.sessionId} model -> ${state.currentModel}`);
+      await this.applyModelChoice(state, { model: params.value });
+      log(
+        `session ${params.sessionId} model -> ${state.currentModelEntryId ?? state.currentModel}`,
+      );
+      return { configOptions: await this.sessionConfigOptions(state) };
+    }
+    if (params.configId === REASONING_EFFORT_CONFIG_ID) {
+      if (typeof params.value !== "string") {
+        throw new Error("The reasoning effort option requires an effort value");
+      }
+      await this.applyModelChoice(state, { effort: params.value });
+      log(
+        `session ${params.sessionId} effort -> ${params.value} (${state.currentModelEntryId})`,
+      );
       return { configOptions: await this.sessionConfigOptions(state) };
     }
     throw new Error(`Unknown session configuration option: ${params.configId}`);
@@ -513,6 +563,8 @@ export class LettaAcpAgent {
       modeId: this.config.permissionMode,
       cwd: options.cwd,
       currentModel: bootstrap.model ?? this.config.model,
+      currentModelEntryId: undefined,
+      currentModelSettings: runtimeModelSettings(session),
     };
     // A client may load the same conversation again while its prior ACP
     // session is still open. Close the displaced SDK session before replacing
@@ -658,9 +710,16 @@ export class LettaAcpAgent {
           `Available models:\n${lines.join("\n")}\n\nSwitch with \`/model <handle>\`.`,
         );
       } else {
-        const result = await state.session.updateModel(argument);
-        state.currentModel = result.modelHandle ?? result.modelId ?? argument;
+        await this.applyModel(state, argument);
         await reply(`Model switched to \`${state.currentModel}\`.`);
+        // Keep the client's model and effort selectors in sync with /model.
+        await cx.notify(methods.client.session.update, {
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "config_option_update",
+            configOptions: await this.sessionConfigOptions(state),
+          },
+        });
       }
     } catch (error) {
       await reply(
@@ -1232,6 +1291,21 @@ export class LettaAcpAgent {
     );
     return agentId;
   }
+}
+
+/**
+ * Model settings the runtime reported when the session started (they carry the
+ * active reasoning_effort and context_window). The SDK keeps them but does not
+ * expose them publicly yet, so read the field defensively; without it the
+ * effort selector falls back to the model's default tier until the user picks.
+ */
+function runtimeModelSettings(
+  session: LettaCodeSession,
+): Record<string, unknown> | null | undefined {
+  const value: unknown = Reflect.get(session, "_modelSettings");
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
 }
 
 function sessionTitle(conversation: LettaConversation): string | undefined {

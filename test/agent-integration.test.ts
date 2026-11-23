@@ -251,8 +251,23 @@ class FakeAppServer {
               label: "Other Model",
               description: "Alternate deterministic model",
             },
+            // One model offered at two reasoning tiers, as Letta lists them.
+            {
+              id: "tiered-low",
+              handle: "test/tiered",
+              label: "Tiered Model",
+              description: "Model with reasoning tiers",
+              updateArgs: { context_window: 200000, reasoning_effort: "low" },
+            },
+            {
+              id: "tiered",
+              handle: "test/tiered",
+              label: "Tiered Model",
+              description: "Model with reasoning tiers",
+              updateArgs: { context_window: 200000, reasoning_effort: "high" },
+            },
           ],
-          available_handles: ["test/model", "test/other-model"],
+          available_handles: ["test/model", "test/other-model", "test/tiered"],
         });
         return;
       case "update_model": {
@@ -268,7 +283,11 @@ class FakeAppServer {
               : requiredString(payload.model_id, "update_model.model_id");
         const handle =
           modelHandle ??
-          (modelId === "other-model" ? "test/other-model" : "test/model");
+          (modelId === "other-model"
+            ? "test/other-model"
+            : modelId.startsWith("tiered")
+              ? "test/tiered"
+              : "test/model");
         socket.push({
           type: "update_model_response",
           request_id: requiredString(message.request_id, "update_model.request_id"),
@@ -968,6 +987,11 @@ describe("Agent SDK app-server integration", () => {
               name: "Other Model",
               description: "Alternate deterministic model",
             },
+            {
+              value: "tiered",
+              name: "Tiered Model",
+              description: "Model with reasoning tiers",
+            },
           ],
         },
       ]);
@@ -997,6 +1021,71 @@ describe("Agent SDK app-server integration", () => {
         category: "model",
         currentValue: "other-model",
       });
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("selects reasoning effort separately from the model", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const { context } = createContext();
+
+    try {
+      const session = await openSession(agent, context);
+      const tiered = await agent.setSessionConfigOption({
+        sessionId: session.sessionId,
+        configId: "model",
+        value: "tiered",
+      });
+      expect(server.updatedModelPayloads.at(-1)).toEqual({ model_id: "tiered" });
+      expect(tiered.configOptions.map((option) => option.id)).toEqual([
+        "permissions",
+        "model",
+        "reasoning_effort",
+      ]);
+      expect(
+        tiered.configOptions.find((option) => option.id === "reasoning_effort"),
+      ).toMatchObject({
+        category: "thought_level",
+        currentValue: "high",
+        options: [
+          { value: "low", name: "Low" },
+          { value: "high", name: "High" },
+        ],
+      });
+
+      const low = await agent.setSessionConfigOption({
+        sessionId: session.sessionId,
+        configId: "reasoning_effort",
+        value: "low",
+      });
+      expect(server.updatedModelPayloads.at(-1)).toEqual({ model_id: "tiered-low" });
+      expect(
+        low.configOptions.find((option) => option.id === "model"),
+      ).toMatchObject({ currentValue: "tiered" });
+      expect(
+        low.configOptions.find((option) => option.id === "reasoning_effort"),
+      ).toMatchObject({ currentValue: "low" });
+
+      // An untiered model drops the effort selector.
+      const other = await agent.setSessionConfigOption({
+        sessionId: session.sessionId,
+        configId: "model",
+        value: "other-model",
+      });
+      expect(other.configOptions.map((option) => option.id)).toEqual([
+        "permissions",
+        "model",
+      ]);
+
+      await expect(
+        agent.setSessionConfigOption({
+          sessionId: session.sessionId,
+          configId: "reasoning_effort",
+          value: "low",
+        }),
+      ).rejects.toThrow("has no low reasoning effort");
     } finally {
       agent.shutdown();
     }
