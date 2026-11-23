@@ -1,6 +1,12 @@
 import {
   type AgentContext,
   type CancelNotification,
+  type CloseSessionRequest,
+  type CloseSessionResponse,
+  type DeleteSessionRequest,
+  type DeleteSessionResponse,
+  type ForkSessionRequest,
+  type ForkSessionResponse,
   type ContentBlock,
   type InitializeRequest,
   type InitializeResponse,
@@ -285,7 +291,7 @@ export class LettaAcpAgent {
       protocolVersion,
       agentCapabilities: {
         loadSession: true,
-        sessionCapabilities: { list: {} },
+        sessionCapabilities: { list: {}, close: {}, delete: {}, fork: {} },
         mcpCapabilities: { http: true, sse: true },
         promptCapabilities: {
           image: true,
@@ -325,14 +331,7 @@ export class LettaAcpAgent {
     params: LoadSessionRequest,
     cx: AgentContext,
   ): Promise<LoadSessionResponse> {
-    if (
-      !params.sessionId.startsWith("conv-") &&
-      !params.sessionId.startsWith("local-conv-")
-    ) {
-      throw new Error(
-        `Cannot load session ${params.sessionId}: not a Letta conversation id`,
-      );
-    }
+    assertConversationId(params.sessionId, "load");
     const { sessionId, state } = await this.openSession({
       cwd: params.cwd,
       resumeId: params.sessionId,
@@ -420,6 +419,54 @@ export class LettaAcpAgent {
         ? { nextCursor: last.sessionId }
         : {}),
     };
+  }
+
+  /** Ends the session's work and releases its Letta session. */
+  async closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
+    const state = this.sessions.get(params.sessionId);
+    if (!state) return {};
+    if (state.promptActive) await this.cancel({ sessionId: params.sessionId });
+    this.sessions.delete(params.sessionId);
+    state.session.close();
+    log(`closed session ${params.sessionId}`);
+    return {};
+  }
+
+  /**
+   * Removes a session from session/list. The Letta conversation is archived
+   * rather than destroyed, so its history and the agent's memory stay.
+   */
+  async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
+    assertConversationId(params.sessionId, "delete");
+    await this.closeSession({ sessionId: params.sessionId });
+    await this.client.conversations.update(params.sessionId, { archived: true });
+    await this.sessionRegistry.remove(params.sessionId);
+    log(`archived session ${params.sessionId}`);
+    return {};
+  }
+
+  /**
+   * Copies the session's conversation into a new one, which is ready to
+   * prompt. Letta forks the in-context history; the client keeps its own copy
+   * of the transcript, so nothing is replayed.
+   */
+  async forkSession(
+    params: ForkSessionRequest,
+    cx: AgentContext,
+  ): Promise<ForkSessionResponse> {
+    assertConversationId(params.sessionId, "fork");
+    const fork = await this.client.conversations.fork(params.sessionId);
+    const { sessionId, state } = await this.openSession({
+      cwd: params.cwd,
+      resumeId: fork.id,
+      agentId: null,
+      clientContext: cx,
+      mcpServers: params.mcpServers ?? [],
+    });
+    await this.rememberSession(state.session.agentId, sessionId, params.cwd);
+    log(`forked session ${params.sessionId} -> ${sessionId}`);
+    this.announceCommands(sessionId, cx);
+    return { sessionId, ...(await this.sessionSetup(state)) };
   }
 
   private async rememberSession(
@@ -1812,6 +1859,12 @@ function runtimeModelSettings(
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : undefined;
+}
+
+function assertConversationId(sessionId: string, action: string): void {
+  if (!sessionId.startsWith("conv-") && !sessionId.startsWith("local-conv-")) {
+    throw new Error(`Cannot ${action} session ${sessionId}: not a Letta conversation id`);
+  }
 }
 
 /** Context window of the session's current model, when known. */

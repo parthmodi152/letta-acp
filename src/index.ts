@@ -47,6 +47,15 @@ const connection = await acp
   .onRequest(acp.methods.agent.session.list, (ctx) =>
     agent.listSessions(ctx.params),
   )
+  .onRequest(acp.methods.agent.session.close, (ctx) =>
+    agent.closeSession(ctx.params),
+  )
+  .onRequest(acp.methods.agent.session.delete, (ctx) =>
+    agent.deleteSession(ctx.params),
+  )
+  .onRequest(acp.methods.agent.session.fork, (ctx) =>
+    agent.forkSession(ctx.params, ctx.client),
+  )
   .onRequest(acp.methods.agent.session.setMode, (ctx) =>
     agent.setSessionMode(ctx.params, ctx.client),
   )

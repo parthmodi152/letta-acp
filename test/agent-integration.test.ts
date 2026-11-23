@@ -29,6 +29,8 @@ class FakeAppServer {
   readonly createdAgentPinGlobals: unknown[] = [];
   readonly approvalResponses: WireMessage[] = [];
   readonly conversationRetrieveIds: string[] = [];
+  readonly conversationUpdates: Array<{ id: string; body: WireMessage }> = [];
+  readonly forkedConversationIds: string[] = [];
   closedSockets = 0;
   readonly updatedModelPayloads: WireMessage[] = [];
   private nextConversation = 0;
@@ -238,6 +240,28 @@ class FakeAppServer {
           memory_directory: "/tmp/letta-acp-memory",
         });
         return;
+      case "conversation_fork": {
+        const source = requiredString(message.conversation_id, "conversation_fork.conversation_id");
+        this.forkedConversationIds.push(source);
+        socket.push({
+          type: "conversation_fork_response",
+          request_id: requiredString(message.request_id, "conversation_fork.request_id"),
+          success: true,
+          conversation: { id: `conv-fork-of-${source}`, agent_id: "agent-test" },
+        });
+        return;
+      }
+      case "conversation_update": {
+        const id = requiredString(message.conversation_id, "conversation_update.conversation_id");
+        this.conversationUpdates.push({ id, body: message.body as WireMessage });
+        socket.push({
+          type: "conversation_update_response",
+          request_id: requiredString(message.request_id, "conversation_update.request_id"),
+          success: true,
+          conversation: { id, agent_id: "agent-test", ...(message.body as WireMessage) },
+        });
+        return;
+      }
       case "conversation_retrieve": {
         const conversationId = requiredString(
           message.conversation_id,
@@ -1893,6 +1917,58 @@ describe("Agent SDK app-server integration", () => {
       ).toEqual(["REPLACEMENT_OK"]);
     } finally {
       agent.shutdown();
+    }
+  });
+
+  test("closes, archives and forks sessions", async () => {
+    const server = new FakeAppServer();
+    const registryDir = await mkdtemp(join(tmpdir(), "letta-acp-registry-"));
+    const agent = createAgent(server, { sessionRegistryDir: registryDir });
+    const { context } = createContext();
+
+    try {
+      const initialized = await agent.initialize({ protocolVersion: 1, clientCapabilities: {} });
+      expect(initialized.agentCapabilities?.sessionCapabilities).toEqual({
+        list: {},
+        close: {},
+        delete: {},
+        fork: {},
+      });
+      const session = await agent.newSession({ cwd: "/tmp/letta-acp-test", mcpServers: [] }, context);
+
+      const fork = await agent.forkSession(
+        { sessionId: session.sessionId, cwd: "/tmp/letta-acp-test", mcpServers: [] },
+        context,
+      );
+      expect(server.forkedConversationIds).toEqual([session.sessionId]);
+      expect(fork.sessionId).toBe(`conv-fork-of-${session.sessionId}`);
+      expect(fork.configOptions?.length).toBeGreaterThan(0);
+      // The fork is ready to prompt without a session/load.
+      const forkPrompt = await agent.prompt(
+        { sessionId: fork.sessionId, prompt: [{ type: "text", text: "replacement after cancel" }] },
+        context,
+      );
+      expect(forkPrompt.stopReason).toBe("end_turn");
+
+      await agent.closeSession({ sessionId: fork.sessionId });
+      await expect(
+        agent.prompt(
+          { sessionId: fork.sessionId, prompt: [{ type: "text", text: "plain prompt" }] },
+          context,
+        ),
+      ).rejects.toThrow();
+      // Closing twice is harmless.
+      expect(await agent.closeSession({ sessionId: fork.sessionId })).toEqual({});
+
+      await agent.deleteSession({ sessionId: session.sessionId });
+      expect(server.conversationUpdates).toEqual([
+        { id: session.sessionId, body: { archived: true } },
+      ]);
+      const listed = await agent.listSessions({ cwd: "/tmp/letta-acp-test" });
+      expect(listed.sessions.map((entry) => entry.sessionId)).toEqual([fork.sessionId]);
+    } finally {
+      agent.shutdown();
+      await rm(registryDir, { recursive: true, force: true });
     }
   });
 

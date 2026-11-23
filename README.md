@@ -200,6 +200,10 @@ adapter and delegate to the ACP client.
 | `session/cancel` → `stopReason: cancelled` | ✅ |
 | `session/load` (resume threads with history replay) | ✅ |
 | `session/list` (project-scoped persisted session discovery) | ✅ |
+| `session/close` (cancels running work, releases the Letta session) | ✅ |
+| `session/delete` (archives the Letta conversation; history and memory stay) | ✅ |
+| `session/fork` (copies the conversation's in-context history into a new session) | ✅ |
+| Background turns (subagent / task notifications, cron) shown as they run, outside prompts | ✅ |
 | Session modes (`session/set_mode`: standard / acceptEdits / unrestricted) | ✅ |
 | Model listing and switching (`configOptions` + `session/set_config_option`) | ✅ |
 | Reasoning effort as its own selector (`thought_level` config option; per-model tiers in legacy `models` `_meta`) | ✅ |
