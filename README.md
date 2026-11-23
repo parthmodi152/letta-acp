@@ -181,6 +181,7 @@ non-loopback deployments enable auth
 | `LETTA_ACP_MODEL` | optional model override for sessions, as a `provider/model` handle (e.g. `anthropic/claude-fable-5`, `openai/gpt-4.1`); new agents default to `letta/auto`, while reused agents keep their model when this is unset — run `/model` to list valid handles |
 | `LETTA_ACP_PERMISSION_MODE` | initial session mode: `standard` (default), `acceptEdits`, `unrestricted` — switchable live via `session/set_mode` (Zed's mode dropdown) |
 | `LETTA_ACP_PERMISSION_SELECTOR` | `on` (default) or `off`. `off` stops advertising the permission mode as a session mode / config option, for clients with their own approval control (e.g. T3 Code). `LETTA_ACP_PERMISSION_MODE` still applies and approvals still go to the client. |
+| `LETTA_ACP_IMAGE_LINKS` | `auto` (default), `on` or `off`. Images that tools return (Read/ViewImage of an image, screenshots) always go in the tool card as ACP image content. With links on, they also follow as a markdown image of the file, which T3 Code renders (it does not render ACP image content). `auto` turns links on for T3 Code. Images without a file are saved under `~/.letta/letta-acp/images/`. |
 
 Note on tool execution: with `remote` and `cloud`, built-in tools (Read, Bash,
 …) run where the harness runs — the server/sandbox filesystem, not your
@@ -204,6 +205,7 @@ adapter and delegate to the ACP client.
 | `session/delete` (archives the Letta conversation; history and memory stay) | ✅ |
 | `session/fork` (copies the conversation's in-context history into a new session) | ✅ |
 | Background turns (subagent / task notifications, cron) shown as they run, outside prompts | ✅ |
+| Tool images (ACP image content; markdown file links for T3 Code) | ✅ |
 | Session modes (`session/set_mode`: standard / acceptEdits / unrestricted) | ✅ |
 | Model listing and switching (`configOptions` + `session/set_config_option`) | ✅ |
 | Reasoning effort as its own selector (`thought_level` config option; per-model tiers in legacy `models` `_meta`) | ✅ |

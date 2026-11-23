@@ -28,6 +28,7 @@ import {
   type SetSessionModeRequest,
   type SetSessionModeResponse,
   type StopReason,
+  type ToolCallContent,
 } from "@agentclientprotocol/sdk";
 import {
   type CanUseToolContext,
@@ -60,6 +61,15 @@ import {
   resolveSelection,
 } from "./model-options.js";
 import { MessageInbox } from "./message-inbox.js";
+import {
+  imageMarkdown,
+  readImageFile,
+  resultMentionsImage,
+  saveToolImage,
+  storedToolImages,
+  toolImagePath,
+  type ToolImage,
+} from "./tool-images.js";
 import { isPlanTool, PlanTracker } from "./plan.js";
 import { withAcpRequestTimeout } from "./request-timeout.js";
 import { SessionRegistry } from "./session-registry.js";
@@ -154,6 +164,11 @@ interface AcpSessionState {
    * session drains the SDK; outside a prompt it forwards them directly.
    */
   inbox: MessageInbox<SDKMessage>;
+  /**
+   * Tool results that returned an image the stream left out. Their images
+   * are read from the stored messages before the next message is shown.
+   */
+  pendingImages: Array<{ toolCallId: string; content: ToolCallContent[] }>;
   /** Context window the server last reported for this conversation. */
   reportedContextWindow: number | undefined;
   /** Catalog context window, looked up once per model. */
@@ -227,6 +242,8 @@ export class LettaAcpAgent {
     readTextFile: false,
     writeTextFile: false,
   };
+  /** Whether tool images are also posted as markdown links to their file. */
+  private imageLinks = false;
   /** Optional client features that change how updates are reported. */
   private clientFeatures = {
     compactionUpdates: false,
@@ -278,6 +295,10 @@ export class LettaAcpAgent {
       | Record<string, unknown>
       | null
       | undefined;
+    this.imageLinks =
+      this.config.imageLinks === "on" ||
+      ((this.config.imageLinks ?? "auto") === "auto" &&
+        params.clientInfo?.name === "t3-code");
     this.clientFeatures = {
       compactionUpdates: sessionCaps?.compaction != null,
       notices: sessionCaps?.notices != null,
@@ -758,6 +779,7 @@ export class LettaAcpAgent {
       catalogContextWindow: null,
       reportedContextWindow: undefined,
       inbox: new MessageInbox(),
+      pendingImages: [],
     };
     // A client may load the same conversation again while its prior ACP
     // session is still open. Close the displaced SDK session before replacing
@@ -875,6 +897,7 @@ export class LettaAcpAgent {
       if (state.cancelled) return { stopReason: "cancelled" };
       throw error;
     } finally {
+      await this.flushPendingImages(params.sessionId, state, cx);
       await this.settleCompaction(params.sessionId, state, cx).catch((error: unknown) => {
         log(`could not close the compaction card: ${String(error)}`);
       });
@@ -1080,6 +1103,7 @@ export class LettaAcpAgent {
         log(
           `out-of-turn ${message.origin ?? "session"} turn ended (${message.success ? "ok" : message.errorCode ?? "failed"})`,
         );
+        await this.flushPendingImages(sessionId, state, state.clientContext);
         await this.settleCompaction(sessionId, state, state.clientContext);
         return;
       }
@@ -1248,6 +1272,16 @@ export class LettaAcpAgent {
     cx: AgentContext,
   ): Promise<boolean> {
     if (
+      state.pendingImages.length > 0 &&
+      (message.type === "assistant" ||
+        message.type === "reasoning" ||
+        message.type === "tool_call")
+    ) {
+      // The server has stored the tool return by the time the model speaks
+      // again, so its image can be shown before what comes next.
+      await this.flushPendingImages(sessionId, state, cx);
+    }
+    if (
       state.openCompactionId &&
       (message.type === "assistant" ||
         message.type === "reasoning" ||
@@ -1409,6 +1443,17 @@ export class LettaAcpAgent {
               : {}),
           },
         });
+        if (toolCall && !message.isError) {
+          await this.collectToolImages(
+            sessionId,
+            state,
+            cx,
+            message.toolCallId,
+            toolCall,
+            message.content,
+            resultContent,
+          );
+        }
         return true;
       }
       case "error":
@@ -1554,6 +1599,102 @@ export class LettaAcpAgent {
           },
     });
     return id;
+  }
+
+  /**
+   * Shows an image a tool returned. A file-reading tool's image comes from
+   * the file itself; any other result that mentions an image waits for the
+   * stored message, which holds the image the stream left out.
+   */
+  private async collectToolImages(
+    sessionId: string,
+    state: AcpSessionState,
+    cx: AgentContext,
+    toolCallId: string,
+    toolCall: StreamedToolCall,
+    output: string,
+    content: ToolCallContent[],
+  ): Promise<void> {
+    const path = toolImagePath(toolCall.toolName, toolCall.input.input, state.cwd);
+    const image = path ? await readImageFile(path) : undefined;
+    if (image) {
+      await this.showToolImages(sessionId, cx, toolCallId, content, [image]);
+      return;
+    }
+    if (resultMentionsImage(output)) state.pendingImages.push({ toolCallId, content });
+  }
+
+  private async flushPendingImages(
+    sessionId: string,
+    state: AcpSessionState,
+    cx: AgentContext,
+  ): Promise<void> {
+    if (state.pendingImages.length === 0) return;
+    const pending = state.pendingImages.splice(0);
+    try {
+      let messages: readonly unknown[] = [];
+      for (let attempt = 0; attempt < 2; attempt++) {
+        if (attempt > 0) await new Promise((done) => setTimeout(done, 1_000));
+        messages = (await state.session.listMessages({ order: "desc", limit: 30 })).messages;
+        if (pending.every((entry) => storedToolImages(messages, entry.toolCallId) !== null)) break;
+      }
+      for (const entry of pending) {
+        const stored = storedToolImages(messages, entry.toolCallId) ?? [];
+        if (stored.length === 0) {
+          log(`no stored image for tool call ${entry.toolCallId}`);
+          continue;
+        }
+        const images = await Promise.all(
+          stored.map((image, index) =>
+            this.imageLinks
+              ? saveToolImage(image, `${entry.toolCallId}-${index + 1}`)
+              : { ...image, name: `image-${index + 1}` },
+          ),
+        );
+        await this.showToolImages(sessionId, cx, entry.toolCallId, entry.content, images);
+      }
+    } catch (error) {
+      log(`could not show tool images: ${String(error)}`);
+    }
+  }
+
+  /**
+   * Adds the images to the tool card as ACP image content. With image links
+   * on, they also follow as a markdown image message, which T3 Code renders
+   * from the file.
+   */
+  private async showToolImages(
+    sessionId: string,
+    cx: AgentContext,
+    toolCallId: string,
+    content: ToolCallContent[],
+    images: ToolImage[],
+  ): Promise<void> {
+    log(`showing ${images.length} image(s) from tool call ${toolCallId}`);
+    await cx.notify(methods.client.session.update, {
+      sessionId,
+      update: {
+        sessionUpdate: "tool_call_update",
+        toolCallId,
+        content: [
+          ...content,
+          ...images.map((image) => ({
+            type: "content" as const,
+            content: { type: "image" as const, data: image.data, mimeType: image.mimeType },
+          })),
+        ],
+      },
+    });
+    if (!this.imageLinks) return;
+    const markdown = images.map(imageMarkdown).filter(Boolean).join("\n\n");
+    if (!markdown) return;
+    await cx.notify(methods.client.session.update, {
+      sessionId,
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: `\n\n${markdown}\n\n` },
+      },
+    });
   }
 
   /** Closes a compaction whose summary never arrived. */

@@ -14,6 +14,8 @@
  *   LETTA_ACP_MODEL            optional model override (new agents default letta/auto)
  *   LETTA_ACP_PERMISSION_MODE  standard (default) | acceptEdits | unrestricted
  *   LETTA_ACP_PERMISSION_SELECTOR  on (default) | off — hide the permission selector
+ *   LETTA_ACP_IMAGE_LINKS      auto (default) | on | off — also post tool images as
+ *                              markdown file links (auto: on for T3 Code)
  */
 import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";

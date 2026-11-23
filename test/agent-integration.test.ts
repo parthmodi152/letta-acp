@@ -31,6 +31,8 @@ class FakeAppServer {
   readonly conversationRetrieveIds: string[] = [];
   readonly conversationUpdates: Array<{ id: string; body: WireMessage }> = [];
   readonly forkedConversationIds: string[] = [];
+  /** Messages the fake returns from conversation_messages_list. */
+  storedMessages: WireMessage[] = [];
   closedSockets = 0;
   readonly updatedModelPayloads: WireMessage[] = [];
   private nextConversation = 0;
@@ -303,7 +305,7 @@ class FakeAppServer {
             "conversation_messages_list.request_id",
           ),
           success: true,
-          messages: [],
+          messages: this.storedMessages,
           has_more: false,
         });
         return;
@@ -877,8 +879,13 @@ async function openSession(
   context: AgentContext,
   cwd = "/tmp/letta-acp-test",
   clientCapabilities: Record<string, unknown> = {},
+  clientName?: string,
 ) {
-  await agent.initialize({ protocolVersion: 1, clientCapabilities });
+  await agent.initialize({
+    protocolVersion: 1,
+    clientCapabilities,
+    ...(clientName ? { clientInfo: { name: clientName, version: "1" } } : {}),
+  });
   return agent.newSession({ cwd, mcpServers: [] }, context);
 }
 
@@ -1969,6 +1976,121 @@ describe("Agent SDK app-server integration", () => {
     } finally {
       agent.shutdown();
       await rm(registryDir, { recursive: true, force: true });
+    }
+  });
+
+  test("shows an image a file read returned, with a markdown link for T3 Code", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "letta-acp-image-"));
+    const imagePath = join(dir, "chart.png");
+    await writeFile(imagePath, Buffer.from("fake-png-bytes"));
+    const server = new FakeAppServer();
+    server.script("read image prompt", "run-read-image", [
+      {
+        message_type: "tool_call_message",
+        tool_calls: [{ id: "call-read-image", name: "Read", arguments: JSON.stringify({ file_path: imagePath }) }],
+      },
+      {
+        message_type: "tool_return_message",
+        tool_call_id: "call-read-image",
+        tool_return: "[Image: chart.png]",
+        status: "success",
+      },
+      { message_type: "assistant_message", content: "IT_IS_A_CHART" },
+    ]);
+    const agent = createAgent(server);
+    const { context, updates } = createContext();
+
+    try {
+      const session = await openSession(agent, context, dir, {}, "t3-code");
+      await agent.prompt(
+        { sessionId: session.sessionId, prompt: [{ type: "text", text: "read image prompt" }] },
+        context,
+      );
+      const imageUpdate = updates.find(
+        (update) =>
+          update.toolCallId === "call-read-image" &&
+          JSON.stringify(update.content ?? []).includes('"type":"image"'),
+      );
+      expect((imageUpdate?.content as WireMessage[]).at(-1)).toEqual({
+        type: "content",
+        content: {
+          type: "image",
+          data: Buffer.from("fake-png-bytes").toString("base64"),
+          mimeType: "image/png",
+        },
+      });
+      const texts = updates
+        .filter((update) => update.sessionUpdate === "agent_message_chunk")
+        .map((update) => (update.content as { text: string }).text);
+      expect(texts).toEqual([`\n\n![chart.png](<${imagePath}>)\n\n`, "IT_IS_A_CHART"]);
+    } finally {
+      agent.shutdown();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("recovers an image the stream left out from the stored tool return", async () => {
+    const server = new FakeAppServer();
+    const data = Buffer.from("screenshot-bytes").toString("base64");
+    server.storedMessages = [
+      {
+        message_type: "tool_return_message",
+        tool_call_id: "call-shot",
+        tool_return: "[Image omitted]",
+        tool_returns: [
+          {
+            type: "tool",
+            tool_call_id: "call-shot",
+            status: "success",
+            tool_return: [
+              { type: "text", text: "Screenshot taken" },
+              { type: "image", source: { type: "base64", media_type: "image/png", data } },
+            ],
+          },
+        ],
+      },
+    ];
+    server.script("screenshot prompt", "run-shot", [
+      {
+        message_type: "tool_call_message",
+        tool_calls: [{ id: "call-shot", name: "mcp__browser__screenshot", arguments: "{}" }],
+      },
+      {
+        message_type: "tool_return_message",
+        tool_call_id: "call-shot",
+        tool_return: "Screenshot taken [Image omitted]",
+        status: "success",
+      },
+      { message_type: "assistant_message", content: "AFTER_SHOT" },
+    ]);
+    const agent = createAgent(server);
+    const { context, updates } = createContext();
+
+    try {
+      // Not T3 Code: the image goes in the tool card only.
+      const session = await openSession(agent, context);
+      await agent.prompt(
+        { sessionId: session.sessionId, prompt: [{ type: "text", text: "screenshot prompt" }] },
+        context,
+      );
+      const imageIndex = updates.findIndex(
+        (update) =>
+          update.toolCallId === "call-shot" &&
+          JSON.stringify(update.content ?? []).includes('"type":"image"'),
+      );
+      const replyIndex = updates.findIndex(
+        (update) => update.sessionUpdate === "agent_message_chunk",
+      );
+      expect(imageIndex).toBeGreaterThan(-1);
+      // Shown before the reply that follows the tool call.
+      expect(imageIndex).toBeLessThan(replyIndex);
+      expect(
+        updates
+          .filter((update) => update.sessionUpdate === "agent_message_chunk")
+          .map((update) => (update.content as { text: string }).text),
+      ).toEqual(["AFTER_SHOT"]);
+    } finally {
+      agent.shutdown();
     }
   });
 

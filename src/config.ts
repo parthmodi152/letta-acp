@@ -35,6 +35,12 @@ export interface LettaAcpConfig {
    */
   prematureResultGraceMs?: number;
   /**
+   * Whether tool images are also posted as markdown image links to their
+   * file, for clients that render markdown images but not ACP image content
+   * (T3 Code). `auto` turns it on for T3 Code. Defaults to `auto`.
+   */
+  imageLinks?: "auto" | "on" | "off";
+  /**
    * After a cancel, how long to keep waiting for the aborted turn's terminal
    * result once the server reports idle. Defaults to 5 seconds.
    */
@@ -125,8 +131,16 @@ export function configFromEnv(
     );
   }
 
+  const imageLinks = env.LETTA_ACP_IMAGE_LINKS?.trim().toLowerCase() || "auto";
+  if (imageLinks !== "auto" && imageLinks !== "on" && imageLinks !== "off") {
+    throw new Error(
+      `Unknown LETTA_ACP_IMAGE_LINKS "${env.LETTA_ACP_IMAGE_LINKS}" (expected auto | on | off)`,
+    );
+  }
+
   return {
     clientOptions,
+    imageLinks,
     agentId: env.LETTA_AGENT_ID,
     model: env.LETTA_ACP_MODEL,
     permissionMode: permissionMode as PermissionMode,

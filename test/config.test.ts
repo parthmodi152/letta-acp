@@ -27,6 +27,14 @@ describe("ACP agent defaults", () => {
     ).toThrow('Unknown LETTA_ACP_PERMISSION_SELECTOR "maybe"');
   });
 
+  test("reads the image link switch", () => {
+    expect(configFromEnv({}).imageLinks).toBe("auto");
+    expect(configFromEnv({ LETTA_ACP_IMAGE_LINKS: " OFF " }).imageLinks).toBe("off");
+    expect(() => configFromEnv({ LETTA_ACP_IMAGE_LINKS: "maybe" })).toThrow(
+      'Unknown LETTA_ACP_IMAGE_LINKS "maybe"',
+    );
+  });
+
   test("preserves explicit agent and model overrides", () => {
     const config = configFromEnv({
       LETTA_AGENT_ID: "agent-existing",
