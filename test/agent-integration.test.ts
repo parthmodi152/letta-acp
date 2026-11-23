@@ -41,6 +41,7 @@ class FakeAppServer {
   private cancelablePromptActive = false;
   private cancelableRunId: string | null = null;
   private replacementRuns = 0;
+  private openBackgroundRun: string | null = null;
   private readonly scripts = new Map<
     string,
     { runId: string; deltas: WireMessage[]; afterStop: WireMessage[] }
@@ -114,6 +115,32 @@ class FakeAppServer {
     afterStop: WireMessage[] = [],
   ): void {
     this.scripts.set(trigger, { runId, deltas, afterStop });
+  }
+
+  /**
+   * Runs a turn the session did not send, as Letta does for a subagent's
+   * task notification: the queue reports a dequeued item from another source,
+   * then the run streams. With `finish: false` the run stays open until the
+   * next prompt arrives.
+   */
+  pushBackgroundTurn(runId: string, text: string, options: { finish?: boolean } = {}): void {
+    const socket = this.activeControlSocket;
+    const runtime = this.activeRuntime;
+    if (!socket || !runtime) throw new Error("No active runtime for a background turn");
+    socket.push({
+      type: "update_queue",
+      runtime,
+      queue: [],
+      removed: [
+        { client_message_id: `bg-${runId}`, disposition: "dequeued", source: "task_notification" },
+      ],
+    });
+    this.pushDelta(socket, runtime, { message_type: "assistant_message", run_id: runId, content: text });
+    if (options.finish === false) {
+      this.openBackgroundRun = runId;
+      return;
+    }
+    this.finishTurn(socket, runtime, runId, "end_turn");
   }
 
   /** Resolves with the next approval_response the adapter sends back. */
@@ -420,6 +447,11 @@ class FakeAppServer {
       return;
     }
     const promptText = JSON.stringify(payload.messages);
+    if (this.openBackgroundRun) {
+      // Letta finishes the running background turn before taking new input.
+      this.finishTurn(socket, runtime, this.openBackgroundRun, "end_turn");
+      this.openBackgroundRun = null;
+    }
     if (promptText.includes("thinking prompt to cancel")) {
       // A run that has started (the model is thinking) but produced no
       // visible output yet, as when a user steers during a slow first step.
@@ -1784,6 +1816,81 @@ describe("Agent SDK app-server integration", () => {
           summary: [{ type: "text", text: "Short." }],
         },
       ]);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("forwards a background turn that runs between prompts", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const { context, updates } = createContext();
+
+    try {
+      const session = await openSession(agent, context);
+      await agent.prompt(
+        { sessionId: session.sessionId, prompt: [{ type: "text", text: "plain prompt" }] },
+        context,
+      );
+      server.pushBackgroundTurn("run-background", "SUBAGENT_DONE");
+      await Bun.sleep(50);
+      const texts = () =>
+        updates
+          .filter((update) => update.sessionUpdate === "agent_message_chunk")
+          .map((update) => (update.content as { text: string }).text);
+      // Shown as it happens, not held for the next prompt.
+      expect(texts()).toEqual(["PROMPT_OK", "SUBAGENT_DONE"]);
+
+      const response = await raceTimeout(
+        agent.prompt(
+          {
+            sessionId: session.sessionId,
+            prompt: [{ type: "text", text: "replacement after cancel" }],
+          },
+          context,
+        ),
+        2_000,
+      );
+      expect(response.stopReason).toBe("end_turn");
+      expect(texts()).toEqual(["PROMPT_OK", "SUBAGENT_DONE", "REPLACEMENT_OK"]);
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("a background turn ending mid-prompt does not end the prompt", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const { context, updates } = createContext();
+
+    try {
+      const session = await openSession(agent, context);
+      await agent.prompt(
+        { sessionId: session.sessionId, prompt: [{ type: "text", text: "plain prompt" }] },
+        context,
+      );
+      server.pushBackgroundTurn("run-background-open", "SUBAGENT_WORKING", { finish: false });
+      await Bun.sleep(20);
+      const before = updates.length;
+      const response = await raceTimeout(
+        agent.prompt(
+          {
+            sessionId: session.sessionId,
+            prompt: [{ type: "text", text: "replacement after cancel" }],
+          },
+          context,
+        ),
+        2_000,
+      );
+      expect(response.stopReason).toBe("end_turn");
+      // The prompt waited for its own reply instead of ending on the
+      // background turn's result.
+      expect(
+        updates
+          .slice(before)
+          .filter((update) => update.sessionUpdate === "agent_message_chunk")
+          .map((update) => (update.content as { text: string }).text),
+      ).toEqual(["REPLACEMENT_OK"]);
     } finally {
       agent.shutdown();
     }

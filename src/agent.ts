@@ -53,6 +53,7 @@ import {
   REASONING_EFFORT_CONFIG_ID,
   resolveSelection,
 } from "./model-options.js";
+import { MessageInbox } from "./message-inbox.js";
 import { isPlanTool, PlanTracker } from "./plan.js";
 import { withAcpRequestTimeout } from "./request-timeout.js";
 import { SessionRegistry } from "./session-registry.js";
@@ -142,6 +143,11 @@ interface AcpSessionState {
   compactions: number;
   /** The compaction whose summary has not arrived yet. */
   openCompactionId: string | null;
+  /**
+   * Messages read from the SDK while a prompt is running. One reader per
+   * session drains the SDK; outside a prompt it forwards them directly.
+   */
+  inbox: MessageInbox<SDKMessage>;
   /** Context window the server last reported for this conversation. */
   reportedContextWindow: number | undefined;
   /** Catalog context window, looked up once per model. */
@@ -704,6 +710,7 @@ export class LettaAcpAgent {
       openCompactionId: null,
       catalogContextWindow: null,
       reportedContextWindow: undefined,
+      inbox: new MessageInbox(),
     };
     // A client may load the same conversation again while its prior ACP
     // session is still open. Close the displaced SDK session before replacing
@@ -713,6 +720,7 @@ export class LettaAcpAgent {
       displaced.session.close();
     }
     this.sessions.set(sessionId, state);
+    this.startReader(sessionId, state);
     return { sessionId, state };
   }
 
@@ -827,6 +835,10 @@ export class LettaAcpAgent {
       // in-a-turn marker is cleared, so late tool traffic still reaches the
       // client but waits on a deadline.
       state.promptActive = false;
+      // Whatever arrived after the turn's result belongs to no prompt now.
+      for (const message of state.inbox.drain()) {
+        await this.forwardOutOfTurn(params.sessionId, state, message);
+      }
     }
   }
 
@@ -922,59 +934,112 @@ export class LettaAcpAgent {
       ...(argument ? { args: argument } : {}),
     });
 
-    for (let round = 0; round < EXECUTE_COMMAND_MAX_ROUNDS; round++) {
-      // A cancel can land between stream rounds after a nested command turn
-      // produced its terminal result. Do not attach another stream listener
-      // once the command has already been aborted.
+    let nestedTurns = 0;
+    while (true) {
       if (state.cancelled) return { stopReason: "cancelled" };
-      for await (const message of state.session.stream()) {
-        if (state.cancelled) return { stopReason: "cancelled" };
-        if (TRACE) log(`trace ${sessionId} command ${describeSdkMessage(message)}`);
-        if (message.type === "stream_event") {
-          const event = message.event as Record<string, unknown>;
-          if (
-            event.message_type === "slash_command_end" &&
-            event.command_id === command
-          ) {
-            const output = typeof event.output === "string" ? event.output : "";
-            const success = event.success !== false;
-            if (output) {
-              await cx.notify(methods.client.session.update, {
-                sessionId,
-                update: {
-                  sessionUpdate: "agent_message_chunk",
-                  content: {
-                    type: "text",
-                    text: success ? output : `/${command} failed: ${output}`,
-                  },
+      const step = await state.inbox.next();
+      if (!step || step.done) break;
+      const message = step.value;
+      if (state.cancelled) return { stopReason: "cancelled" };
+      if (TRACE) log(`trace ${sessionId} command ${describeSdkMessage(message)}`);
+      if (message.type === "stream_event") {
+        const event = message.event as Record<string, unknown>;
+        if (
+          event.message_type === "slash_command_end" &&
+          event.command_id === command
+        ) {
+          const output = typeof event.output === "string" ? event.output : "";
+          const success = event.success !== false;
+          if (output) {
+            await cx.notify(methods.client.session.update, {
+              sessionId,
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: {
+                  type: "text",
+                  text: success ? output : `/${command} failed: ${output}`,
                 },
-              });
-            }
-            return { stopReason: "end_turn" };
+              },
+            });
           }
-          // /compact reports its summary as ordinary stream events.
-          await this.forwardStreamEvent(sessionId, state, message.event, cx);
+          return { stopReason: "end_turn" };
+        }
+        // /compact reports its summary as ordinary stream events.
+        await this.forwardStreamEvent(sessionId, state, message.event, cx);
+        continue;
+      }
+      if (message.type === "result") {
+        // A background turn (task notification, cron) is not the command's.
+        if (message.origin !== undefined) {
+          log(`background ${message.origin} turn ended during /${command}`);
           continue;
         }
-        if (message.type === "result") {
-          // Commands like /init and /remember run a full agent turn. A
-          // successful nested result, or a recoverable approval conflict,
-          // ends this SDK stream round but not the command: its continuation
-          // and slash_command_end arrive through a subsequent stream().
-          if (
-            message.success ||
-            message.errorCode === "approval_conflict"
-          ) {
-            continue;
-          }
-          // Do not turn genuine nested-turn failures into 50 opaque recovery
-          // rounds followed by "/<command> did not complete".
-          return this.toPromptResponse(state, message);
+        // Commands like /init and /remember run a full agent turn. A
+        // successful nested result, or a recoverable approval conflict, is
+        // not the end of the command: its continuation and slash_command_end
+        // follow.
+        if (message.success || message.errorCode === "approval_conflict") {
+          if (++nestedTurns >= EXECUTE_COMMAND_MAX_ROUNDS) break;
+          continue;
         }
-        await this.forwardMessage(sessionId, state, message, cx);
+        // Do not turn genuine nested-turn failures into 50 opaque recovery
+        // rounds followed by "/<command> did not complete".
+        return this.toPromptResponse(state, message);
       }
+      await this.forwardMessage(sessionId, state, message, cx);
     }
     throw new Error(`/${command} did not complete`);
+  }
+
+  /**
+   * The session's only SDK reader. The SDK ends each stream() at the result
+   * of a turn this session sent, so the reader starts the next one at once.
+   * Messages go to the running prompt, or straight to the client when no
+   * prompt is running (background turns such as subagent notifications).
+   */
+  private startReader(sessionId: string, state: AcpSessionState): void {
+    void (async () => {
+      try {
+        while (this.sessions.get(sessionId) === state) {
+          let received = false;
+          for await (const message of state.session.stream()) {
+            received = true;
+            if (state.promptActive) state.inbox.push(message);
+            else await this.forwardOutOfTurn(sessionId, state, message);
+          }
+          // An empty stream means the SDK session closed.
+          if (!received) break;
+        }
+      } catch (error) {
+        log(`session ${sessionId} reader stopped: ${String(error)}`);
+      } finally {
+        state.inbox.close();
+      }
+    })();
+  }
+
+  /** Forwards a message that arrived while no prompt was running. */
+  private async forwardOutOfTurn(
+    sessionId: string,
+    state: AcpSessionState,
+    message: SDKMessage,
+  ): Promise<void> {
+    try {
+      if (this.isStaleRunMessage(state, message)) return;
+      // Leftovers of a cancelled turn: the client was already told it ended.
+      if (state.cancelled) return;
+      if (TRACE) log(`trace ${sessionId} idle ${describeSdkMessage(message)}`);
+      if (message.type === "result") {
+        log(
+          `out-of-turn ${message.origin ?? "session"} turn ended (${message.success ? "ok" : message.errorCode ?? "failed"})`,
+        );
+        await this.settleCompaction(sessionId, state, state.clientContext);
+        return;
+      }
+      await this.forwardMessage(sessionId, state, message, state.clientContext);
+    } catch (error) {
+      log(`could not forward an out-of-turn message: ${String(error)}`);
+    }
   }
 
   /**
@@ -995,13 +1060,11 @@ export class LettaAcpAgent {
     let idleStatusCount = 0;
     let activeRunIds: readonly string[] = [];
 
-    const stream = state.session.stream()[Symbol.asyncIterator]();
     let awaitingFirstMessage = true;
     // Set once a cancelled turn reports idle: how long to keep waiting for its
     // terminal result before giving up on it.
     let cancelDrainUntil: number | undefined;
     while (true) {
-      const pending = stream.next();
       // Only the first message of a grace round is raced: a server that went
       // quiet after contradicting itself must not wedge the prompt.
       const deadlineMs =
@@ -1010,8 +1073,7 @@ export class LettaAcpAgent {
           : awaitingFirstMessage
             ? firstMessageDeadlineMs
             : undefined;
-      const step =
-        deadlineMs !== undefined ? await raceDeadline(pending, deadlineMs) : await pending;
+      const step = await state.inbox.next(deadlineMs);
       if (!step) {
         if (cancelDrainUntil !== undefined) {
           // The aborted turn's result may still arrive; make sure it cannot
@@ -1032,6 +1094,13 @@ export class LettaAcpAgent {
         log(`trace ${sessionId} ${mode}${state.cancelled ? " cancelled" : ""} ${describeSdkMessage(message)}`);
       }
       if (this.isStaleRunMessage(state, message)) continue;
+      if (message.type === "result" && message.origin !== undefined) {
+        // A turn the session did not send (a task notification, a cron
+        // prompt) ended. Its events were shown in this prompt; the prompt's
+        // own turn is still running, so keep going.
+        log(`background ${message.origin} turn ended during a prompt`);
+        continue;
+      }
       for (const runId of messageRunIds(message)) state.turnRunIds.add(runId);
 
       if (state.cancelled) {
@@ -1758,23 +1827,6 @@ function sessionTitle(conversation: LettaConversation): string | undefined {
   const title = source.replace(/[\r\n]+/g, " ").replace(/\s+/g, " ").trim();
   if (!title) return undefined;
   return title.length <= 256 ? title : `${title.slice(0, 255)}…`;
-}
-
-/** Awaits `pending`, or resolves null when the deadline expires first. */
-async function raceDeadline<T>(
-  pending: Promise<T>,
-  timeoutMs: number,
-): Promise<T | null> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const deadline = new Promise<null>((resolve) => {
-    timer = setTimeout(() => resolve(null), timeoutMs);
-    timer.unref?.();
-  });
-  try {
-    return await Promise.race([pending, deadline]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
 }
 
 /**
