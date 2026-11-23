@@ -110,10 +110,13 @@ export function configFromEnv(
     );
   }
 
-  const permissionSelector = env.LETTA_ACP_PERMISSION_SELECTOR ?? "on";
+  // Clients may pass an empty value for a variable the user left blank; treat
+  // that as unset rather than refusing to start.
+  const permissionSelector =
+    env.LETTA_ACP_PERMISSION_SELECTOR?.trim().toLowerCase() || "on";
   if (permissionSelector !== "on" && permissionSelector !== "off") {
     throw new Error(
-      `Unknown LETTA_ACP_PERMISSION_SELECTOR "${permissionSelector}" (expected on | off)`,
+      `Unknown LETTA_ACP_PERMISSION_SELECTOR "${env.LETTA_ACP_PERMISSION_SELECTOR}" (expected on | off)`,
     );
   }
 

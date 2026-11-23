@@ -14,6 +14,19 @@ describe("ACP agent defaults", () => {
     });
   });
 
+  test("reads the permission selector switch, treating blank as unset", () => {
+    expect(configFromEnv({}).permissionSelector).toBe(true);
+    expect(
+      configFromEnv({ LETTA_ACP_PERMISSION_SELECTOR: "" }).permissionSelector,
+    ).toBe(true);
+    expect(
+      configFromEnv({ LETTA_ACP_PERMISSION_SELECTOR: " OFF " }).permissionSelector,
+    ).toBe(false);
+    expect(() =>
+      configFromEnv({ LETTA_ACP_PERMISSION_SELECTOR: "maybe" }),
+    ).toThrow('Unknown LETTA_ACP_PERMISSION_SELECTOR "maybe"');
+  });
+
   test("preserves explicit agent and model overrides", () => {
     const config = configFromEnv({
       LETTA_AGENT_ID: "agent-existing",
