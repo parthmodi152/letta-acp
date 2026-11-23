@@ -54,3 +54,33 @@ describe("plan tracker", () => {
     expect(isPlanTool("Read")).toBe(false);
   });
 });
+
+describe("plan tracker with Letta Code task snapshots", () => {
+  test("takes the full list from a task tool's snapshot", () => {
+    const plan = new PlanTracker();
+    plan.apply("TaskCreate", {}, {
+      taskId: "task_2",
+      subject: "Two",
+      status: "pending",
+      tasks: [
+        { taskId: "task_1", subject: "One", status: "completed", order: 0 },
+        { taskId: "task_2", subject: "Two", status: "pending", order: 1 },
+      ],
+    });
+    expect(plan.entries().map((entry) => entry.content)).toEqual(["One", "Two"]);
+  });
+});
+
+test("replaces the plan from UpdatePlan input", () => {
+  const plan = new PlanTracker();
+  plan.apply("UpdatePlan", {
+    plan: [
+      { step: "Read code", status: "completed" },
+      { step: "Write fix", status: "in_progress" },
+    ],
+  }, "Plan updated");
+  expect(plan.entries()).toEqual([
+    { content: "Read code", priority: "medium", status: "completed" },
+    { content: "Write fix", priority: "medium", status: "in_progress" },
+  ]);
+});

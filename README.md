@@ -208,11 +208,10 @@ adapter and delegate to the ACP client.
 | MCP servers from `session/new` / `session/load` | ✅ stdio, HTTP, and SSE via Agent SDK external tools |
 | Native Bash result rendering (`_meta.terminal_output`) | ✅ when supported by the client |
 | Client-side command execution (`terminal/*`) | ❌ (planned) |
-| Plan updates (`plan` from TaskCreate / TaskUpdate / TaskList / TodoWrite) | ✅ |
+| Plan updates (`plan` from TaskCreate / TaskUpdate / TaskList / TodoWrite / UpdatePlan) | ✅ |
 | Context and cost meter (`usage_update` from Letta usage statistics) | ✅ |
 | Compaction (`compaction_update` with `session.compaction`; a "Compact context" tool card otherwise) | ✅ |
 | Model retries (`notice` with `session.notices`; a thought line otherwise) | ✅ |
-| AskUserQuestion as a form (`elicitation/create`, form mode); without forms the model asks in chat | ✅ |
 
 ACP session ids are Letta conversation ids, so `session/load` works across
 adapter restarts when the client already knows the id: the conversation is

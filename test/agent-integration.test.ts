@@ -785,7 +785,6 @@ function createContext(
     answerPermissions?: boolean;
     permissionDelayMs?: number;
     permissionOptionId?: "allow_once" | "allow_always" | "reject_once";
-    elicitationResponse?: WireMessage;
   } = {},
 ) {
   const answerPermissions = options.answerPermissions ?? true;
@@ -794,20 +793,15 @@ function createContext(
   const updates: WireMessage[] = [];
   const permissionRequests: WireMessage[] = [];
   const permissionSignals: Array<AbortSignal | undefined> = [];
-  const elicitationRequests: WireMessage[] = [];
   const context = {
     notify: async (_method: unknown, params: { update: WireMessage }) => {
       updates.push(params.update);
     },
     request: async (
-      method: unknown,
+      _method: unknown,
       params: WireMessage,
       requestOptions?: { cancellationSignal?: AbortSignal },
     ) => {
-      if (method === "elicitation/create") {
-        elicitationRequests.push(params);
-        return options.elicitationResponse ?? { action: "cancel" };
-      }
       permissionRequests.push(params);
       permissionSignals.push(requestOptions?.cancellationSignal);
       if (!answerPermissions) return new Promise(() => {});
@@ -819,13 +813,7 @@ function createContext(
       };
     },
   } as unknown as AgentContext;
-  return {
-    context,
-    updates,
-    permissionRequests,
-    permissionSignals,
-    elicitationRequests,
-  };
+  return { context, updates, permissionRequests, permissionSignals };
 }
 
 async function openSession(
@@ -1757,93 +1745,6 @@ describe("Agent SDK app-server integration", () => {
           summary: [{ type: "text", text: "Short." }],
         },
       ]);
-    } finally {
-      agent.shutdown();
-    }
-  });
-
-  test("asks AskUserQuestion as a form and returns the answers", async () => {
-    const server = new FakeAppServer();
-    const agent = createAgent(server, { permissionMode: "unrestricted" });
-    const { context, permissionRequests, elicitationRequests } = createContext({
-      elicitationResponse: { action: "accept", content: { q1: "luxon" } },
-    });
-    const question = {
-      question: "Which library should we use?",
-      header: "Library",
-      options: [
-        { label: "date-fns", description: "Small" },
-        { label: "luxon", description: "Time zones" },
-      ],
-    };
-
-    try {
-      const session = await openSession(agent, context, undefined, {
-        elicitation: { form: {} },
-      });
-      await agent.prompt(
-        { sessionId: session.sessionId, prompt: [{ type: "text", text: "plain prompt" }] },
-        context,
-      );
-      const approval = server.nextApprovalResponse();
-      server.requestPermissionAfterPrompt({
-        requestId: "ask-request",
-        toolName: "AskUserQuestion",
-        toolCallId: "call-ask",
-        input: { questions: [question] },
-      });
-
-      expect(await approval).toEqual(
-        expect.objectContaining({
-          request_id: "ask-request",
-          decision: expect.objectContaining({
-            behavior: "allow",
-            updated_input: {
-              questions: [question],
-              answers: { "Which library should we use?": "luxon" },
-            },
-          }),
-        }),
-      );
-      expect(permissionRequests).toEqual([]);
-      expect(elicitationRequests).toEqual([
-        expect.objectContaining({
-          sessionId: session.sessionId,
-          toolCallId: "call-ask",
-          mode: "form",
-          message: "Which library should we use?",
-        }),
-      ]);
-    } finally {
-      agent.shutdown();
-    }
-  });
-
-  test("tells the model to ask in chat when the client has no forms", async () => {
-    const server = new FakeAppServer();
-    const agent = createAgent(server);
-    const { context, permissionRequests, elicitationRequests } = createContext();
-
-    try {
-      const session = await openSession(agent, context);
-      await agent.prompt(
-        { sessionId: session.sessionId, prompt: [{ type: "text", text: "plain prompt" }] },
-        context,
-      );
-      const approval = server.nextApprovalResponse();
-      server.requestPermissionAfterPrompt({
-        requestId: "ask-request",
-        toolName: "AskUserQuestion",
-        toolCallId: "call-ask",
-        input: { questions: [{ question: "Proceed?", header: "Go", options: [] }] },
-      });
-      expect(await approval).toEqual(
-        expect.objectContaining({
-          decision: expect.objectContaining({ behavior: "deny" }),
-        }),
-      );
-      expect(permissionRequests).toEqual([]);
-      expect(elicitationRequests).toEqual([]);
     } finally {
       agent.shutdown();
     }

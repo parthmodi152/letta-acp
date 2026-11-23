@@ -40,7 +40,11 @@ export function parseStreamEvent(event: unknown): LettaStreamEvent | null {
   const raw = event as Record<string, unknown>;
   switch (raw.message_type) {
     case "usage_statistics": {
-      const contextTokens = number(raw.context_tokens) ?? number(raw.prompt_tokens);
+      // prompt_tokens is a fair stand-in only for a single step; a run-level
+      // aggregate sums every step's prompt and would overstate the context.
+      const contextTokens =
+        number(raw.context_tokens) ??
+        (raw.step_count === 1 ? number(raw.prompt_tokens) : undefined);
       if (contextTokens === undefined) return null;
       const costUsd = number(raw.api_cost_usd);
       return {

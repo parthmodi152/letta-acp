@@ -2,7 +2,6 @@ import {
   type AgentContext,
   type CancelNotification,
   type ContentBlock,
-  type CreateElicitationResponse,
   type InitializeRequest,
   type InitializeResponse,
   type LoadSessionRequest,
@@ -36,7 +35,6 @@ import {
   type SDKMessage,
   type SDKResultMessage,
 } from "@letta-ai/letta-agent-sdk";
-import { ASK_USER_QUESTION_TOOL, askUserAnswers, askUserForm } from "./ask-user.js";
 import { authMethodsForClient } from "./auth.js";
 import { DEFAULT_ACP_MODEL, type LettaAcpConfig } from "./config.js";
 import {
@@ -215,7 +213,6 @@ export class LettaAcpAgent {
   };
   /** Optional client features that change how updates are reported. */
   private clientFeatures = {
-    elicitationForm: false,
     compactionUpdates: false,
     notices: false,
   };
@@ -266,7 +263,6 @@ export class LettaAcpAgent {
       | null
       | undefined;
     this.clientFeatures = {
-      elicitationForm: params.clientCapabilities?.elicitation?.form != null,
       compactionUpdates: sessionCaps?.compaction != null,
       notices: sessionCaps?.notices != null,
     };
@@ -1432,71 +1428,6 @@ export class LettaAcpAgent {
     });
   }
 
-  /**
-   * AskUserQuestion carries its answers back in the approval. Clients with
-   * form elicitation show the questions as a form; others get a denial that
-   * tells the model to ask in an ordinary message instead.
-   */
-  private async askUserQuestion(
-    sessionId: string,
-    state: AcpSessionState,
-    cx: AgentContext,
-    toolInput: Record<string, unknown>,
-    toolCallId: string | undefined,
-  ): Promise<CanUseToolResponse> {
-    const form = askUserForm(toolInput);
-    if (!this.clientFeatures.elicitationForm || !form) {
-      log("AskUserQuestion: client has no form elicitation; asking in chat instead");
-      return {
-        behavior: "deny",
-        message:
-          "AskUserQuestion is not available in this client. Ask the same questions in an ordinary message and wait for the user's reply.",
-      };
-    }
-    const params = {
-      sessionId,
-      ...(toolCallId ? { toolCallId } : {}),
-      mode: "form" as const,
-      message: form.message,
-      requestedSchema: form.requestedSchema,
-    };
-    let response: unknown;
-    try {
-      response = state.promptActive
-        ? await cx.request(methods.client.elicitation.create, params)
-        : await withAcpRequestTimeout(
-            (signal) =>
-              cx.request(methods.client.elicitation.create, params, {
-                cancellationSignal: signal,
-              }),
-            {
-              label: "Question",
-              description: "answer the agent's questions outside a prompt turn",
-              timeoutMs: this.outOfTurnPermissionTimeoutMs,
-            },
-          );
-    } catch (error) {
-      log(`AskUserQuestion elicitation failed: ${String(error)}`);
-      return {
-        behavior: "deny",
-        message: error instanceof Error ? error.message : String(error),
-        interrupt: true,
-      };
-    }
-    const outcome = askUserAnswers(form, response as CreateElicitationResponse);
-    if (outcome.kind === "declined") {
-      return { behavior: "deny", message: outcome.message };
-    }
-    const previous =
-      toolInput.answers && typeof toolInput.answers === "object"
-        ? (toolInput.answers as Record<string, unknown>)
-        : {};
-    return {
-      behavior: "allow",
-      updatedInput: { ...toolInput, answers: { ...previous, ...outcome.answers } },
-    };
-  }
-
   private toPromptResponse(
     state: AcpSessionState,
     result: SDKResultMessage,
@@ -1567,16 +1498,6 @@ export class LettaAcpAgent {
     toolInput: Record<string, unknown>,
     context: CanUseToolContext | undefined,
   ): Promise<CanUseToolResponse> {
-    // Questions need the user's answers, so no permission mode skips them.
-    if (toolName === ASK_USER_QUESTION_TOOL) {
-      return this.askUserQuestion(
-        sessionId,
-        state,
-        cx,
-        toolInput,
-        context?.toolCallId,
-      );
-    }
     const workspaceEditorRead = await editorReadAutoAllows(
       state.modeId,
       toolName,

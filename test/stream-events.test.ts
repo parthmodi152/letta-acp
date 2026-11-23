@@ -12,8 +12,11 @@ describe("Letta stream events", () => {
       }),
     ).toEqual({ kind: "usage", usage: { contextTokens: 1200, costUsd: 0.004 } });
     expect(
-      parseStreamEvent({ message_type: "usage_statistics", prompt_tokens: 900 }),
+      parseStreamEvent({ message_type: "usage_statistics", step_count: 1, prompt_tokens: 900 }),
     ).toEqual({ kind: "usage", usage: { contextTokens: 900 } });
+    expect(
+      parseStreamEvent({ message_type: "usage_statistics", step_count: 3, prompt_tokens: 2700 }),
+    ).toBeNull();
     expect(parseStreamEvent({ message_type: "usage_statistics" })).toBeNull();
   });
 

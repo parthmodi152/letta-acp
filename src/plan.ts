@@ -3,10 +3,10 @@ import type { PlanEntry } from "@agentclientprotocol/sdk";
 /**
  * Tracks the agent's task list so it can be shown as an ACP plan.
  *
- * Letta Code keeps progress in its task tools: TaskCreate and TaskUpdate return
- * the task record they touched, TaskList returns every task, and TaskGet
- * returns one. Older toolsets send the whole list as TodoWrite / todo_write
- * input. ACP's `plan` update replaces the client's checklist each time, so the
+ * Letta Code keeps progress in its task tools: each returns the full task list
+ * as `tasks` (TaskCreate, TaskUpdate and TaskGet also return the record they
+ * touched). Other toolsets send the whole list as tool input: TodoWrite /
+ * todo_write `todos`, or UpdatePlan `plan`. ACP's `plan` update replaces the client's checklist each time, so the
  * tracker keeps the full list and reports it whenever it changes.
  */
 
@@ -19,11 +19,14 @@ interface PlanTask {
 
 const TASK_RECORD_TOOLS = new Set(["TaskCreate", "TaskUpdate", "TaskGet"]);
 const TODO_LIST_TOOLS = new Set(["TodoWrite", "todo_write", "write_todos"]);
+/** Codex-style toolsets send the whole plan as `plan: [{ step, status }]`. */
+const PLAN_LIST_TOOLS = new Set(["UpdatePlan", "update_plan"]);
 
 export function isPlanTool(toolName: string): boolean {
   return (
     TASK_RECORD_TOOLS.has(toolName) ||
     TODO_LIST_TOOLS.has(toolName) ||
+    PLAN_LIST_TOOLS.has(toolName) ||
     toolName === "TaskList"
   );
 }
@@ -45,14 +48,17 @@ export class PlanTracker {
       const todos = input?.todos;
       if (!Array.isArray(todos)) return false;
       this.replace(todos);
-    } else if (toolName === "TaskList") {
-      const tasks = record(output)?.tasks;
-      if (!Array.isArray(tasks)) return false;
-      this.replace(tasks);
-    } else if (TASK_RECORD_TOOLS.has(toolName)) {
-      const task = record(output);
-      if (!task) return false;
-      this.upsert(task);
+    } else if (PLAN_LIST_TOOLS.has(toolName)) {
+      const steps = input?.plan;
+      if (!Array.isArray(steps)) return false;
+      this.replace(steps);
+    } else if (toolName === "TaskList" || TASK_RECORD_TOOLS.has(toolName)) {
+      // Every task tool returns the full list as `tasks`, which also covers
+      // deletions. A bare record is the fallback for older harnesses.
+      const result = record(output);
+      if (Array.isArray(result?.tasks)) this.replace(result.tasks);
+      else if (result && toolName !== "TaskList") this.upsert(result);
+      else return false;
     } else {
       return false;
     }
