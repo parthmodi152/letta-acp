@@ -101,6 +101,18 @@ interface AcpSessionState {
   /** Tools the user chose "always allow" for, scoped to this session. */
   alwaysAllowed: Set<string>;
   cancelled: boolean;
+  /** Settles when the session's latest prompt has finished. */
+  promptChain: Promise<void>;
+  /** The abort sent by the last cancel, until the server has processed it. */
+  abortInFlight: Promise<void> | null;
+  /** Run ids observed during the current prompt's turn. */
+  turnRunIds: Set<string>;
+  /**
+   * Runs of cancelled turns whose terminal result was never consumed. Their
+   * late events and results are dropped instead of being taken for the next
+   * prompt's (which would shift every later reply by one).
+   */
+  staleRunIds: Set<string>;
   /** True only while a session/prompt handler is running. */
   promptActive: boolean;
   /** ACP session mode; enforced adapter-side in the permission callback. */
@@ -137,6 +149,12 @@ const DEFAULT_OUT_OF_TURN_PERMISSION_TIMEOUT_MS = 300_000;
  * enough that a server which never speaks again cannot wedge the prompt.
  */
 const DEFAULT_PREMATURE_RESULT_GRACE_MS = 30_000;
+/**
+ * After a cancel, how long a prompt keeps draining the aborted turn for its
+ * terminal result once the server reports idle. Letta Cloud sends that result
+ * right after the idle status even when the turn had no visible output yet.
+ */
+const DEFAULT_CANCEL_DRAIN_MS = 5_000;
 
 /** Safety cap on stream rounds while waiting for a slash command to finish. */
 const EXECUTE_COMMAND_MAX_ROUNDS = 50;
@@ -167,6 +185,7 @@ export class LettaAcpAgent {
   private readonly client: LettaAgentClient;
   private readonly outOfTurnPermissionTimeoutMs: number;
   private readonly prematureResultGraceMs: number;
+  private readonly cancelDrainMs: number;
   private readonly sessionRegistry: SessionRegistry;
   private readonly sessions = new Map<string, AcpSessionState>();
   private agentIdPromise: Promise<string> | null = null;
@@ -188,6 +207,23 @@ export class LettaAcpAgent {
       DEFAULT_OUT_OF_TURN_PERMISSION_TIMEOUT_MS;
     this.prematureResultGraceMs =
       config.prematureResultGraceMs ?? DEFAULT_PREMATURE_RESULT_GRACE_MS;
+    this.cancelDrainMs = config.cancelDrainMs ?? DEFAULT_CANCEL_DRAIN_MS;
+  }
+
+  /**
+   * True for an event or result of a cancelled turn whose result was never
+   * consumed. A result settles its runs, so they stop being tracked.
+   */
+  private isStaleRunMessage(state: AcpSessionState, message: SDKMessage): boolean {
+    if (state.staleRunIds.size === 0) return false;
+    const runIds = messageRunIds(message);
+    if (message.type === "loop_status" || runIds.length === 0) return false;
+    if (!runIds.every((runId) => state.staleRunIds.has(runId))) return false;
+    if (message.type === "result") {
+      for (const runId of runIds) state.staleRunIds.delete(runId);
+      log(`dropped late result of cancelled run ${runIds.join(", ")}`);
+    }
+    return true;
   }
 
   async initialize(params: InitializeRequest): Promise<InitializeResponse> {
@@ -614,6 +650,10 @@ export class LettaAcpAgent {
       toolCalls: new Map(),
       alwaysAllowed: new Set(),
       cancelled: false,
+      promptChain: Promise.resolve(),
+      abortInFlight: null,
+      turnRunIds: new Set(),
+      staleRunIds: new Set(),
       promptActive: false,
       modeId: this.config.permissionMode,
       cwd: options.cwd,
@@ -653,9 +693,35 @@ export class LettaAcpAgent {
     if (!state) {
       throw new Error(`Unknown session: ${params.sessionId}`);
     }
+    // One prompt at a time per session: a prompt that arrives while a
+    // cancelled one is still draining its turn waits for it, so the two can
+    // never read each other's events from the shared SDK stream.
+    const previous = state.promptChain;
+    let release!: () => void;
+    state.promptChain = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await this.runPrompt(params, state, cx);
+    } finally {
+      release();
+    }
+  }
+
+  private async runPrompt(
+    params: PromptRequest,
+    state: AcpSessionState,
+    cx: AgentContext,
+  ): Promise<PromptResponse> {
     state.clientContext = cx;
+    // A steer (cancel, then an immediate new prompt) must not send before the
+    // server has processed the abort: aborting clears the server's input
+    // queue, which would silently drop the new message.
+    if (state.abortInFlight) await state.abortInFlight;
     state.cancelled = false;
     state.promptActive = true;
+    state.turnRunIds = new Set();
 
     try {
       const commandResponse = await this.maybeRunCommand(params, state, cx);
@@ -881,21 +947,52 @@ export class LettaAcpAgent {
 
     const stream = state.session.stream()[Symbol.asyncIterator]();
     let awaitingFirstMessage = true;
+    // Set once a cancelled turn reports idle: how long to keep waiting for its
+    // terminal result before giving up on it.
+    let cancelDrainUntil: number | undefined;
     while (true) {
       const pending = stream.next();
       // Only the first message of a grace round is raced: a server that went
       // quiet after contradicting itself must not wedge the prompt.
+      const deadlineMs =
+        cancelDrainUntil !== undefined
+          ? Math.max(0, cancelDrainUntil - Date.now())
+          : awaitingFirstMessage
+            ? firstMessageDeadlineMs
+            : undefined;
       const step =
-        awaitingFirstMessage && firstMessageDeadlineMs !== undefined
-          ? await raceDeadline(pending, firstMessageDeadlineMs)
-          : await pending;
+        deadlineMs !== undefined ? await raceDeadline(pending, deadlineMs) : await pending;
       if (!step) {
-        log("no further activity during the grace round; ending turn");
+        if (cancelDrainUntil !== undefined) {
+          // The aborted turn's result may still arrive; make sure it cannot
+          // be taken for the next prompt's.
+          for (const runId of state.turnRunIds) state.staleRunIds.add(runId);
+          log(
+            `cancelled turn left no result within ${this.cancelDrainMs}ms; ignoring runs ${[...state.turnRunIds].join(", ") || "(none)"}`,
+          );
+        } else {
+          log("no further activity during the grace round; ending turn");
+        }
         return { kind: "idle" };
       }
       awaitingFirstMessage = false;
       if (step.done) break;
       const message = step.value;
+      if (TRACE) {
+        log(`trace ${sessionId} ${mode}${state.cancelled ? " cancelled" : ""} ${describeSdkMessage(message)}`);
+      }
+      if (this.isStaleRunMessage(state, message)) continue;
+      for (const runId of messageRunIds(message)) state.turnRunIds.add(runId);
+
+      if (state.cancelled) {
+        // Drain the aborted turn without forwarding it: ACP already told the
+        // client the turn was cancelled. Its terminal result ends the drain.
+        if (message.type === "result") return { kind: "result", result: message };
+        if (message.type === "loop_status" && message.status === "WAITING_ON_INPUT") {
+          cancelDrainUntil ??= Date.now() + this.cancelDrainMs;
+        }
+        continue;
+      }
 
       if (message.type === "result") {
         // An idle loop status that still lists active runs makes the SDK
@@ -913,15 +1010,6 @@ export class LettaAcpAgent {
       }
       if (message.type === "loop_status") {
         activeRunIds = message.activeRunIds;
-        // An abort after real turn activity makes the SDK enqueue this idle
-        // status followed by the cancelled turn's synthesized result. Drain
-        // that result before returning so the next prompt cannot consume it
-        // as its own terminal event. An abort before any activity has no
-        // result, so the idle status remains its only completion signal.
-        if (message.status === "WAITING_ON_INPUT" && state.cancelled) {
-          if (sawActivity) continue;
-          return { kind: "idle" };
-        }
         if (mode === "recovery") {
           if (message.status === "WAITING_ON_INPUT") {
             idleStatusCount += 1;
@@ -962,11 +1050,14 @@ export class LettaAcpAgent {
     // Interrupted tool calls never produce a tool_result, so drop their
     // accumulated arguments here instead of leaking them for the session.
     state.toolCalls.clear();
-    try {
-      await state.session.abort();
-    } catch (error) {
+    const abort = state.session.abort().catch((error: unknown) => {
       log(`abort failed for ${params.sessionId}: ${String(error)}`);
-    }
+    });
+    const tracked = abort.finally(() => {
+      if (state.abortInFlight === tracked) state.abortInFlight = null;
+    });
+    state.abortInFlight = tracked;
+    await tracked;
   }
 
   shutdown(): void {
@@ -1346,6 +1437,32 @@ export class LettaAcpAgent {
     );
     return agentId;
   }
+}
+
+/** Run ids an SDK stream message refers to. */
+function messageRunIds(message: SDKMessage): string[] {
+  const record = message as unknown as Record<string, unknown>;
+  const ids: string[] = [];
+  if (typeof record.runId === "string") ids.push(record.runId);
+  for (const key of ["runIds", "activeRunIds"]) {
+    const value = record[key];
+    if (Array.isArray(value)) {
+      for (const id of value) if (typeof id === "string") ids.push(id);
+    }
+  }
+  return ids;
+}
+
+/** LETTA_ACP_TRACE=1 logs every SDK message a prompt consumes (stderr). */
+const TRACE = process.env.LETTA_ACP_TRACE === "1";
+
+/** One-line summary of an SDK stream message for tracing (no content). */
+function describeSdkMessage(message: SDKMessage): string {
+  const record = message as unknown as Record<string, unknown>;
+  const fields = ["type", "messageType", "status", "success", "stopReason", "errorCode", "error", "origin", "runIds", "activeRunIds", "runId"]
+    .filter((key) => record[key] !== undefined)
+    .map((key) => `${key}=${JSON.stringify(record[key])}`);
+  return fields.join(" ").slice(0, 400);
 }
 
 /**

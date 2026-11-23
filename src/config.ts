@@ -34,6 +34,11 @@ export interface LettaAcpConfig {
    * listing active runs. Defaults to 30 seconds.
    */
   prematureResultGraceMs?: number;
+  /**
+   * After a cancel, how long to keep waiting for the aborted turn's terminal
+   * result once the server reports idle. Defaults to 5 seconds.
+   */
+  cancelDrainMs?: number;
 }
 
 const PERMISSION_MODES: PermissionMode[] = [

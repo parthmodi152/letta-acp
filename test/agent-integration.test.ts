@@ -36,6 +36,9 @@ class FakeAppServer {
   private commandWaiters: Array<() => void> = [];
   private cancelablePromptWaiters: Array<() => void> = [];
   private cancelablePromptActive = false;
+  private cancelableRunId: string | null = null;
+  private replacementRuns = 0;
+  private abortSettling = false;
 
   socketConstructor(): LettaCodeSocketConstructor {
     const server = this;
@@ -324,6 +327,18 @@ class FakeAppServer {
             },
           });
           this.cancelablePromptActive = false;
+          // Letta Cloud settles the aborted run right after the idle status,
+          // even when the run had produced no visible output yet.
+          const run = this.cancelableRunId;
+          if (run) {
+            this.cancelableRunId = null;
+            this.abortSettling = true;
+            const runtime = this.activeRuntime!;
+            setTimeout(() => {
+              this.finishTurn(socket, runtime, run, "cancelled");
+              this.abortSettling = false;
+            }, 20);
+          }
         }
         return;
       default:
@@ -377,7 +392,29 @@ class FakeAppServer {
       throw new Error(`Unhandled fake input payload: ${String(payload.kind)}`);
     }
 
+    if (this.abortSettling) {
+      // Like Letta Cloud, finish processing the abort (and settle the aborted
+      // run) before starting the next queued input.
+      setTimeout(() => this.handleInput(socket, message), 40);
+      return;
+    }
     const promptText = JSON.stringify(payload.messages);
+    if (promptText.includes("thinking prompt to cancel")) {
+      // A run that has started (the model is thinking) but produced no
+      // visible output yet, as when a user steers during a slow first step.
+      this.cancelablePromptActive = true;
+      this.cancelableRunId = "run-thinking";
+      socket.push({
+        type: "update_loop_status",
+        runtime,
+        loop_status: {
+          status: "PROCESSING_API_RESPONSE",
+          active_run_ids: ["run-thinking"],
+        },
+      });
+      for (const waiter of this.cancelablePromptWaiters.splice(0)) waiter();
+      return;
+    }
     if (promptText.includes("silent prompt to cancel")) {
       // Accept the turn but emit nothing, as when a steer cancels a turn
       // before the model has produced its first event.
@@ -405,12 +442,14 @@ class FakeAppServer {
       return;
     }
     if (promptText.includes("replacement after cancel")) {
+      // Real runs have unique ids; the SDK ignores a repeated finished run.
+      const runId = `run-replacement-${++this.replacementRuns}`;
       this.pushDelta(socket, runtime, {
         message_type: "assistant_message",
-        run_id: "run-replacement",
+        run_id: runId,
         content: "REPLACEMENT_OK",
       });
-      this.finishTurn(socket, runtime, "run-replacement", "end_turn");
+      this.finishTurn(socket, runtime, runId, "end_turn");
       return;
     }
     if (promptText.includes("fragmented prompt")) {
@@ -679,6 +718,7 @@ function createAgent(
     outOfTurnPermissionTimeoutMs?: number;
     prematureResultGraceMs?: number;
     permissionSelector?: boolean;
+    cancelDrainMs?: number;
   } = {},
 ): LettaAcpAgent {
   return new LettaAcpAgent({
@@ -1992,6 +2032,50 @@ describe("Agent SDK app-server integration", () => {
         sessionUpdate: "agent_message_chunk",
         content: { type: "text", text: "REPLACEMENT_OK" },
       });
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("a steer during a silent first step keeps later replies in order", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, { cancelDrainMs: 1_000 });
+    const { context, updates } = createContext();
+
+    try {
+      const session = await openSession(agent, context);
+      const started = server.nextCancelablePrompt();
+      const first = agent.prompt(
+        {
+          sessionId: session.sessionId,
+          prompt: [{ type: "text", text: "thinking prompt to cancel" }],
+        },
+        context,
+      );
+      await started;
+      await agent.cancel({ sessionId: session.sessionId });
+      expect(await first).toEqual({ stopReason: "cancelled" });
+
+      // The cancelled run's late "cancelled" result must not end (or fail)
+      // the steered prompt, and each later prompt must get its own reply.
+      for (const _ of [1, 2]) {
+        const start = updates.length;
+        const reply = await raceTimeout(
+          agent.prompt(
+            {
+              sessionId: session.sessionId,
+              prompt: [{ type: "text", text: "replacement after cancel" }],
+            },
+            context,
+          ),
+          3000,
+        );
+        expect(reply).toEqual({ stopReason: "end_turn" });
+        expect(updates.slice(start)).toContainEqual({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "REPLACEMENT_OK" },
+        });
+      }
     } finally {
       agent.shutdown();
     }
