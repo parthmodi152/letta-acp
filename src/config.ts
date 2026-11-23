@@ -14,6 +14,12 @@ export interface LettaAcpConfig {
   model?: string;
   /** Letta permission mode; tool approvals are forwarded to the ACP client. */
   permissionMode: PermissionMode;
+  /**
+   * Whether sessions advertise the permission mode as a selectable session
+   * mode / config option. Clients with their own approval control (T3 Code)
+   * turn this off so it is not shown twice. Defaults to true.
+   */
+  permissionSelector?: boolean;
   /** Directory for controller-owned ACP session metadata; null keeps it in memory. */
   sessionRegistryDir?: string | null;
   /** Separates records belonging to different Letta backends. */
@@ -104,11 +110,19 @@ export function configFromEnv(
     );
   }
 
+  const permissionSelector = env.LETTA_ACP_PERMISSION_SELECTOR ?? "on";
+  if (permissionSelector !== "on" && permissionSelector !== "off") {
+    throw new Error(
+      `Unknown LETTA_ACP_PERMISSION_SELECTOR "${permissionSelector}" (expected on | off)`,
+    );
+  }
+
   return {
     clientOptions,
     agentId: env.LETTA_AGENT_ID,
     model: env.LETTA_ACP_MODEL,
     permissionMode: permissionMode as PermissionMode,
+    permissionSelector: permissionSelector === "on",
     sessionRegistryDir:
       env.LETTA_ACP_STATE_DIR ?? join(homedir(), ".letta", "letta-acp", "sessions"),
     sessionRegistryScope,

@@ -38,6 +38,11 @@ export type ReasoningEffort = (typeof REASONING_EFFORT_ORDER)[number];
 
 export const MODEL_CONFIG_ID = "model";
 export const REASONING_EFFORT_CONFIG_ID = "reasoning_effort";
+/**
+ * The effort value of a model without reasoning tiers. Letta Code's picker
+ * labels this "Default"; selecting it leaves the model unchanged.
+ */
+export const DEFAULT_EFFORT_VALUE = "default";
 
 export interface EffortTier {
   effort: ReasoningEffort;
@@ -261,10 +266,26 @@ export function effortLabel(effort: ReasoningEffort, group: ModelGroup): string 
   }
 }
 
+function hasTiers(catalog: ModelCatalog): boolean {
+  return catalog.groups.some((group) => group.tiers.length > 0);
+}
+
+function effortChoices(group: ModelGroup) {
+  return group.tiers.map((tier) => ({
+    value: tier.effort,
+    name: effortLabel(tier.effort, group),
+  }));
+}
+
 /**
- * The model selector, plus a reasoning-effort selector when the current model
- * has more than one tier. A model outside the catalog (custom handle) is kept
- * as the current value so ACP's "currentValue must be an option" rule holds.
+ * The model selector and, when any catalog model has reasoning tiers, a
+ * reasoning-effort selector (ACP category "thought_level"). The effort
+ * selector lists the current model's tiers, or a single "Default" choice for a
+ * model without tiers: it stays present so clients that show effort per model
+ * (T3 Code) keep a reasoning control to attach each model's levels to.
+ *
+ * A model outside the catalog (custom handle) is kept as the current value so
+ * ACP's "currentValue must be an option" rule holds.
  */
 export function modelConfigOptions(
   catalog: ModelCatalog,
@@ -298,20 +319,79 @@ export function modelConfigOptions(
       options,
     },
   ];
-  if (selection?.effort && selection.group.tiers.length > 1) {
-    const group = selection.group;
+  if (hasTiers(catalog)) {
+    const group = selection?.group;
+    const tiered = group !== undefined && group.tiers.length > 0;
     configOptions.push({
       id: REASONING_EFFORT_CONFIG_ID,
-      name: "Reasoning effort",
-      description: `Reasoning effort for ${group.label}`,
+      name: "Reasoning",
+      description: tiered
+        ? `Reasoning effort for ${group.label}`
+        : "This model has no reasoning effort settings",
       category: "thought_level",
       type: "select",
-      currentValue: selection.effort,
-      options: group.tiers.map((tier) => ({
-        value: tier.effort,
-        name: effortLabel(tier.effort, group),
-      })),
+      currentValue: tiered && selection?.effort ? selection.effort : DEFAULT_EFFORT_VALUE,
+      options: tiered
+        ? effortChoices(group)
+        : [{ value: DEFAULT_EFFORT_VALUE, name: "Default" }],
     });
   }
   return configOptions;
+}
+
+/** One model in ACP's legacy `models` session state. */
+export interface LegacyModelInfo {
+  modelId: string;
+  name: string;
+  description?: string;
+  _meta: Record<string, unknown>;
+}
+
+/** ACP's legacy (unstable, pre-config-options) `models` session state. */
+export interface LegacyModelState {
+  currentModelId: string;
+  availableModels: LegacyModelInfo[];
+}
+
+/**
+ * The legacy `models` state, carrying each model's reasoning tiers in `_meta`.
+ *
+ * Config options only describe the *current* model's effort levels. T3 Code
+ * shows effort for every model in its picker by reading these per-model
+ * `_meta` fields (`supportsReasoningEffort`, `reasoningEfforts`,
+ * `reasoningEffort`), the convention Grok's ACP agent uses. Model ids match the
+ * model config option's values, so clients still switch via set_config_option.
+ */
+export function legacyModelState(
+  catalog: ModelCatalog,
+  selection: ModelSelection | undefined,
+): LegacyModelState | undefined {
+  const currentModelId =
+    selection?.group.value ??
+    catalog.groups.find((group) => group.isDefault)?.value ??
+    catalog.groups[0]?.value;
+  if (!currentModelId || !hasTiers(catalog)) return undefined;
+  return {
+    currentModelId,
+    availableModels: catalog.groups.map((group) => {
+      const effort =
+        group === selection?.group ? selection.effort : tierEffort(group, undefined);
+      return {
+        modelId: group.value,
+        name: group.label,
+        ...(group.description ? { description: group.description } : {}),
+        _meta:
+          group.tiers.length > 0 && effort
+            ? {
+                supportsReasoningEffort: true,
+                reasoningEffort: effort,
+                reasoningEfforts: effortChoices(group).map((choice) => ({
+                  value: choice.value,
+                  label: choice.name,
+                })),
+              }
+            : { supportsReasoningEffort: false },
+      };
+    }),
+  };
 }

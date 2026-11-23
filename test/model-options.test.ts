@@ -3,6 +3,7 @@ import {
   buildModelCatalog,
   type CatalogEntry,
   entryForChoice,
+  legacyModelState,
   modelConfigOptions,
   REASONING_EFFORT_CONFIG_ID,
   resolveSelection,
@@ -164,7 +165,7 @@ describe("modelConfigOptions", () => {
     ).toEqual(["astra", "astra-1m", "glm", "opus", "neon"]);
     expect(effort).toEqual({
       id: REASONING_EFFORT_CONFIG_ID,
-      name: "Reasoning effort",
+      name: "Reasoning",
       description: "Reasoning effort for Astra",
       category: "thought_level",
       type: "select",
@@ -194,13 +195,53 @@ describe("modelConfigOptions", () => {
     ]);
   });
 
-  test("omits the effort option for untiered models", () => {
+  test("offers a single Default effort for untiered models", () => {
     const options = modelConfigOptions(
       catalog,
       resolveSelection(catalog, { entryId: "glm" }),
       "letta/glm",
     );
+    expect(options[1]).toMatchObject({
+      id: REASONING_EFFORT_CONFIG_ID,
+      category: "thought_level",
+      currentValue: "default",
+      options: [{ value: "default", name: "Default" }],
+    });
+  });
+
+  test("omits the effort option when no model has tiers", () => {
+    const untiered = buildModelCatalog([CATALOG[7]!]);
+    const options = modelConfigOptions(
+      untiered,
+      resolveSelection(untiered, { entryId: "glm" }),
+      "letta/glm",
+    );
     expect(options.map((option) => option.id)).toEqual(["model"]);
+  });
+
+  test("describes every model's tiers in the legacy models state", () => {
+    const state = legacyModelState(
+      catalog,
+      resolveSelection(catalog, { entryId: "astra-medium" }),
+    );
+    expect(state?.currentModelId).toBe("astra");
+    const byId = new Map(state!.availableModels.map((model) => [model.modelId, model]));
+    expect([...byId.keys()]).toEqual(["astra", "astra-1m", "glm", "opus", "neon"]);
+    // The current model reports its applied effort...
+    expect(byId.get("astra")!._meta).toMatchObject({
+      supportsReasoningEffort: true,
+      reasoningEffort: "medium",
+    });
+    // ...other models their default tier.
+    expect(byId.get("opus")!._meta).toEqual({
+      supportsReasoningEffort: true,
+      reasoningEffort: "high",
+      reasoningEfforts: [
+        { value: "low", label: "Low" },
+        { value: "high", label: "High" },
+      ],
+    });
+    expect(byId.get("glm")!._meta).toEqual({ supportsReasoningEffort: false });
   });
 
   test("keeps a custom model as the current value", () => {

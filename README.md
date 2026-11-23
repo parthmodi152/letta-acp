@@ -180,6 +180,7 @@ non-loopback deployments enable auth
 | `LETTA_AGENT_ID` | reuse an existing agent instead of creating a visible, globally unpinned agent named `Letta` |
 | `LETTA_ACP_MODEL` | optional model override for sessions, as a `provider/model` handle (e.g. `anthropic/claude-fable-5`, `openai/gpt-4.1`); new agents default to `letta/auto`, while reused agents keep their model when this is unset — run `/model` to list valid handles |
 | `LETTA_ACP_PERMISSION_MODE` | initial session mode: `standard` (default), `acceptEdits`, `unrestricted` — switchable live via `session/set_mode` (Zed's mode dropdown) |
+| `LETTA_ACP_PERMISSION_SELECTOR` | `on` (default) or `off`. `off` stops advertising the permission mode as a session mode / config option, for clients with their own approval control (e.g. T3 Code). `LETTA_ACP_PERMISSION_MODE` still applies and approvals still go to the client. |
 
 Note on tool execution: with `remote` and `cloud`, built-in tools (Read, Bash,
 …) run where the harness runs — the server/sandbox filesystem, not your
@@ -201,6 +202,7 @@ adapter and delegate to the ACP client.
 | `session/list` (project-scoped persisted session discovery) | ✅ |
 | Session modes (`session/set_mode`: standard / acceptEdits / unrestricted) | ✅ |
 | Model listing and switching (`configOptions` + `session/set_config_option`) | ✅ |
+| Reasoning effort as its own selector (`thought_level` config option; per-model tiers in legacy `models` `_meta`) | ✅ |
 | Slash commands (`available_commands_update`, ~30 commands + skills) | ✅ |
 | Client fs delegation (`fs/read_text_file`, `fs/write_text_file`) | ✅ via external tools |
 | MCP servers from `session/new` / `session/load` | ✅ stdio, HTTP, and SSE via Agent SDK external tools |

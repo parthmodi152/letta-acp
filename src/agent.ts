@@ -44,8 +44,10 @@ import {
 import { historyToUpdates } from "./history-replay.js";
 import {
   buildModelCatalog,
+  DEFAULT_EFFORT_VALUE,
   entryForChoice,
   isReasoningEffort,
+  legacyModelState,
   MODEL_CONFIG_ID,
   modelConfigOptions,
   REASONING_EFFORT_CONFIG_ID,
@@ -234,11 +236,11 @@ export class LettaAcpAgent {
     await this.rememberSession(agentId, sessionId, params.cwd);
     log(`session ${sessionId} -> agent ${agentId} (cwd: ${params.cwd})`);
     this.announceCommands(sessionId, cx);
-    return {
+    const response: NewSessionResponse = {
       sessionId,
-      modes: sessionModeState(state.modeId),
-      configOptions: await this.sessionConfigOptions(state),
+      ...(await this.sessionSetup(state)),
     };
+    return response;
   }
 
   async loadSession(
@@ -279,10 +281,8 @@ export class LettaAcpAgent {
     }
     log(`loaded session ${sessionId} (${updates.length} replayed updates)`);
     this.announceCommands(sessionId, cx);
-    return {
-      modes: sessionModeState(state.modeId),
-      configOptions: await this.sessionConfigOptions(state),
-    };
+    const response: LoadSessionResponse = await this.sessionSetup(state);
+    return response;
   }
 
   async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
@@ -362,9 +362,8 @@ export class LettaAcpAgent {
     }
   }
 
-  private async sessionConfigOptions(
-    state: AcpSessionState,
-  ): Promise<SessionConfigOption[]> {
+  /** The model catalog and the session's resolved model/effort within it. */
+  private async modelView(state: AcpSessionState) {
     const { entries } = await state.session.listModels();
     const catalog = buildModelCatalog(entries);
     const selection = resolveSelection(catalog, {
@@ -372,13 +371,45 @@ export class LettaAcpAgent {
       model: state.currentModel,
       settings: state.currentModelSettings,
     });
+    return { catalog, selection };
+  }
+
+  private configOptionsFor(
+    state: AcpSessionState,
+    view: Awaited<ReturnType<LettaAcpAgent["modelView"]>>,
+  ): SessionConfigOption[] {
     // A custom model handle may be active even when it is not in the curated
     // catalog; modelConfigOptions keeps it as the current value rather than
     // falsely presenting a different selection.
     return [
-      permissionModeConfigOption(state.modeId),
-      ...modelConfigOptions(catalog, selection, state.currentModel),
+      ...(this.config.permissionSelector === false
+        ? []
+        : [permissionModeConfigOption(state.modeId)]),
+      ...modelConfigOptions(view.catalog, view.selection, state.currentModel),
     ];
+  }
+
+  private async sessionConfigOptions(
+    state: AcpSessionState,
+  ): Promise<SessionConfigOption[]> {
+    return this.configOptionsFor(state, await this.modelView(state));
+  }
+
+  /**
+   * The mode, config option, and legacy model state returned when a session is
+   * created or loaded. `models` is ACP's legacy model API; it is included only
+   * to carry each model's reasoning tiers (see legacyModelState).
+   */
+  private async sessionSetup(state: AcpSessionState) {
+    const view = await this.modelView(state);
+    const models = legacyModelState(view.catalog, view.selection);
+    return {
+      ...(this.config.permissionSelector === false
+        ? {}
+        : { modes: sessionModeState(state.modeId) }),
+      configOptions: this.configOptionsFor(state, view),
+      ...(models ? { models } : {}),
+    };
   }
 
   /**
@@ -399,6 +430,13 @@ export class LettaAcpAgent {
     const groupValue = choice.model ?? current?.group.value;
     if (!groupValue) {
       throw new Error("No current model to apply a reasoning effort to");
+    }
+    if (choice.effort === DEFAULT_EFFORT_VALUE && choice.model === undefined) {
+      // "Default" is the only choice offered for a model without tiers.
+      if (current && current.group.tiers.length > 0) {
+        throw new Error(`${current.group.label} needs an explicit reasoning effort`);
+      }
+      return;
     }
     if (choice.effort !== undefined) {
       const group = catalog.groupByEntryId.get(groupValue);

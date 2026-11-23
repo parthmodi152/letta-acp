@@ -678,6 +678,7 @@ function createAgent(
     sessionRegistryScope?: string;
     outOfTurnPermissionTimeoutMs?: number;
     prematureResultGraceMs?: number;
+    permissionSelector?: boolean;
   } = {},
 ): LettaAcpAgent {
   return new LettaAcpAgent({
@@ -1016,6 +1017,65 @@ describe("Agent SDK app-server integration", () => {
             },
           ],
         },
+        {
+          id: "reasoning_effort",
+          name: "Reasoning",
+          description: "This model has no reasoning effort settings",
+          category: "thought_level",
+          type: "select",
+          currentValue: "default",
+          options: [{ value: "default", name: "Default" }],
+        },
+      ]);
+      // Legacy model state carries each model's tiers for per-model pickers.
+      expect(
+        (session as { models?: unknown }).models,
+      ).toEqual({
+        currentModelId: "test-model",
+        availableModels: [
+          {
+            modelId: "test-model",
+            name: "Test Model",
+            description: "Deterministic test model",
+            _meta: { supportsReasoningEffort: false },
+          },
+          {
+            modelId: "other-model",
+            name: "Other Model",
+            description: "Alternate deterministic model",
+            _meta: { supportsReasoningEffort: false },
+          },
+          {
+            modelId: "tiered",
+            name: "Tiered Model",
+            description: "Model with reasoning tiers",
+            _meta: {
+              supportsReasoningEffort: true,
+              reasoningEffort: "high",
+              reasoningEfforts: [
+                { value: "low", label: "Low" },
+                { value: "high", label: "High" },
+              ],
+            },
+          },
+        ],
+      });
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("hides the permission selector when disabled", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server, { permissionSelector: false });
+    const { context } = createContext();
+
+    try {
+      const session = await openSession(agent, context);
+      expect(session.modes).toBeUndefined();
+      expect(session.configOptions?.map((option) => option.id)).toEqual([
+        "model",
+        "reasoning_effort",
       ]);
     } finally {
       agent.shutdown();
@@ -1090,16 +1150,25 @@ describe("Agent SDK app-server integration", () => {
         low.configOptions.find((option) => option.id === "reasoning_effort"),
       ).toMatchObject({ currentValue: "low" });
 
-      // An untiered model drops the effort selector.
+      // An untiered model narrows the effort selector to "Default".
       const other = await agent.setSessionConfigOption({
         sessionId: session.sessionId,
         configId: "model",
         value: "other-model",
       });
-      expect(other.configOptions.map((option) => option.id)).toEqual([
-        "permissions",
-        "model",
-      ]);
+      expect(
+        other.configOptions.find((option) => option.id === "reasoning_effort"),
+      ).toMatchObject({
+        currentValue: "default",
+        options: [{ value: "default", name: "Default" }],
+      });
+      const payloadCount = server.updatedModelPayloads.length;
+      await agent.setSessionConfigOption({
+        sessionId: session.sessionId,
+        configId: "reasoning_effort",
+        value: "default",
+      });
+      expect(server.updatedModelPayloads).toHaveLength(payloadCount);
 
       await expect(
         agent.setSessionConfigOption({
