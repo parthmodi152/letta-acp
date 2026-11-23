@@ -53,6 +53,25 @@ function startFakeAppServer() {
             }));
             return;
           }
+          case "app_server_info":
+            // SDK >=0.8.8x discovers server capabilities before using a session.
+            socket.send(JSON.stringify({
+              type: "app_server_info_response",
+              request_id: requiredString(message.request_id),
+              success: true,
+              backend: "local",
+              letta_code_version: "0.34.69",
+              protocol_version: 1,
+              capabilities: {
+                agent_management: true,
+                conversation_management: true,
+                memory_management: true,
+                runtime_start: true,
+                // The fake server only speaks on the control channel.
+                split_channels: false,
+              },
+            }));
+            return;
           case "conversation_retrieve":
             socket.send(JSON.stringify({
               type: "conversation_retrieve_response",
