@@ -68,6 +68,12 @@ export function isExecuteCommand(name: string): boolean {
   return EXECUTE_COMMAND_NAMES.has(name);
 }
 
+/** Whether `/name` is a text command or a skill, which the model handles. */
+export function isTextCommand(name: string, cwd: string): boolean {
+  if (TEXT_COMMANDS.some((c) => c.name === name)) return true;
+  return discoverSkills(cwd).some((skill) => skill.name === name);
+}
+
 /** Full command list to advertise for a session rooted at `cwd`. */
 export function buildAvailableCommands(cwd: string): AvailableCommand[] {
   const commands: AvailableCommand[] = [

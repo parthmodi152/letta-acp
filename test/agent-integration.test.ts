@@ -652,6 +652,44 @@ class FakeAppServer {
       // command's nested turn emits its first substantive event.
       return;
     }
+    if (command === "goal") {
+      // A mod command that returns a prompt: the harness ends the command,
+      // then runs the prompt as an ordinary turn.
+      this.pushDelta(socket, runtime, {
+        message_type: "slash_command_end",
+        command_id: command,
+        success: true,
+        output: "Running /goal...",
+      });
+      this.activeCommand = null;
+      this.pushDelta(socket, runtime, {
+        message_type: "assistant_message",
+        run_id: "run-goal",
+        content: `GOAL_TURN ${String(message.args ?? "")}`,
+      });
+      this.finishTurn(socket, runtime, "run-goal", "end_turn");
+      return;
+    }
+    if (command === "goal-status") {
+      this.pushDelta(socket, runtime, {
+        message_type: "slash_command_end",
+        command_id: command,
+        success: true,
+        output: "Goal: ship it (active)",
+      });
+      this.activeCommand = null;
+      return;
+    }
+    if (!["compact", "remember", "clear", "doctor", "context-limit", "reload", "toolset"].includes(command)) {
+      this.pushDelta(socket, runtime, {
+        message_type: "slash_command_end",
+        command_id: command,
+        success: false,
+        output: `Unknown command: ${command}`,
+      });
+      this.activeCommand = null;
+      return;
+    }
     this.pushDelta(socket, runtime, {
       message_type: "tool_call_message",
       run_id: "run-command-approval",
@@ -2484,6 +2522,77 @@ describe("Agent SDK app-server integration", () => {
       expect(updates).toContainEqual({
         sessionUpdate: "agent_message_chunk",
         content: { type: "text", text: "APPROVAL_OK" },
+      });
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("runs a mod command whose prompt starts a turn", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const { context, updates } = createContext();
+
+    try {
+      const session = await openSession(agent, context);
+      const result = await agent.prompt(
+        { sessionId: session.sessionId, prompt: [{ type: "text", text: "/goal resume" }] },
+        context,
+      );
+
+      expect(result).toEqual({ stopReason: "end_turn" });
+      expect(updates).toContainEqual({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "GOAL_TURN resume" },
+      });
+      // The command text never reaches the model as a message.
+      expect(updates).not.toContainEqual({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "PROMPT_OK" },
+      });
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("shows the output of a mod command that returns text", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const { context, updates } = createContext();
+
+    try {
+      const session = await openSession(agent, context);
+      const result = await agent.prompt(
+        { sessionId: session.sessionId, prompt: [{ type: "text", text: "/goal-status" }] },
+        context,
+      );
+
+      expect(result).toEqual({ stopReason: "end_turn" });
+      expect(updates).toContainEqual({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "Goal: ship it (active)" },
+      });
+    } finally {
+      agent.shutdown();
+    }
+  });
+
+  test("sends an unknown /name to the model as text", async () => {
+    const server = new FakeAppServer();
+    const agent = createAgent(server);
+    const { context, updates } = createContext();
+
+    try {
+      const session = await openSession(agent, context);
+      const result = await agent.prompt(
+        { sessionId: session.sessionId, prompt: [{ type: "text", text: "/nosuch thing" }] },
+        context,
+      );
+
+      expect(result).toEqual({ stopReason: "end_turn" });
+      expect(updates).toContainEqual({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "PROMPT_OK" },
       });
     } finally {
       agent.shutdown();

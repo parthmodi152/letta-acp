@@ -92,6 +92,7 @@ import {
 import {
   buildAvailableCommands,
   isExecuteCommand,
+  isTextCommand,
 } from "./slash-commands.js";
 import {
   accumulateToolInput,
@@ -141,6 +142,8 @@ interface AcpSessionState {
   staleRunIds: Set<string>;
   /** True only while a session/prompt handler is running. */
   promptActive: boolean;
+  /** The prompt is waiting on a turn the harness started for a mod command. */
+  awaitingHarnessTurn?: boolean;
   /** ACP session mode; enforced adapter-side in the permission callback. */
   modeId: PermissionMode;
   /** Session working directory (for project skill discovery). */
@@ -203,6 +206,11 @@ const DEFAULT_PREMATURE_RESULT_GRACE_MS = 30_000;
  * right after the idle status even when the turn had no visible output yet.
  */
 const DEFAULT_CANCEL_DRAIN_MS = 5_000;
+
+/** The harness has no command by that name. */
+const UNKNOWN_COMMAND = Symbol("unknown-command");
+/** A mod command returned a prompt, and the harness started its turn. */
+const MOD_PROMPT_STARTED = Symbol("mod-prompt-started");
 
 /** Safety cap on stream rounds while waiting for a slash command to finish. */
 const EXECUTE_COMMAND_MAX_ROUNDS = 50;
@@ -846,8 +854,12 @@ export class LettaAcpAgent {
 
     try {
       const commandResponse = await this.maybeRunCommand(params, state, cx);
-      if (commandResponse) return commandResponse;
-      await state.session.send(toLettaContent(params.prompt));
+      if (commandResponse && commandResponse !== MOD_PROMPT_STARTED) {
+        return commandResponse;
+      }
+      // A mod command that returns a prompt has already started its turn.
+      state.awaitingHarnessTurn = commandResponse === MOD_PROMPT_STARTED;
+      if (!commandResponse) await state.session.send(toLettaContent(params.prompt));
       // The Letta app-server transport completes a turn with a recoverable
       // "approval_conflict" result whenever a tool needs user approval. The
       // approval itself resolves concurrently: the server sends a
@@ -922,7 +934,7 @@ export class LettaAcpAgent {
     params: PromptRequest,
     state: AcpSessionState,
     cx: AgentContext,
-  ): Promise<PromptResponse | null> {
+  ): Promise<PromptResponse | typeof MOD_PROMPT_STARTED | null> {
     const first = params.prompt[0];
     if (params.prompt.length !== 1 || first?.type !== "text") return null;
     const match = first.text.trim().match(/^\/([a-z0-9-]+)(?:\s+([\s\S]*))?$/i);
@@ -930,8 +942,21 @@ export class LettaAcpAgent {
     const command = (match[1] ?? "").toLowerCase();
     const argument = match[2]?.trim();
 
-    if (isExecuteCommand(command)) {
-      return this.runExecuteCommand(params.sessionId, state, cx, command, argument);
+    // Harness commands, plus any other /name that is not a skill or text
+    // command: it may be one a mod registered, which only the harness can
+    // run. When the harness knows no such command, the text goes to the model.
+    if (
+      isExecuteCommand(command) ||
+      (command !== "model" && !isTextCommand(command, state.cwd))
+    ) {
+      const response = await this.runExecuteCommand(
+        params.sessionId,
+        state,
+        cx,
+        command,
+        argument,
+      );
+      return response === UNKNOWN_COMMAND ? null : response;
     }
     if (command !== "model") return null;
 
@@ -991,7 +1016,7 @@ export class LettaAcpAgent {
     cx: AgentContext,
     command: string,
     argument: string | undefined,
-  ): Promise<PromptResponse> {
+  ): Promise<PromptResponse | typeof UNKNOWN_COMMAND | typeof MOD_PROMPT_STARTED> {
     log(`executing /${command} via execute_command`);
     await state.session.sendCommand({
       type: "execute_command",
@@ -1020,6 +1045,16 @@ export class LettaAcpAgent {
         ) {
           const output = typeof event.output === "string" ? event.output : "";
           const success = event.success !== false;
+          if (!success && output === `Unknown command: ${command}`) {
+            log(`/${command} is not a harness or mod command; sending it as text`);
+            return UNKNOWN_COMMAND;
+          }
+          // A mod command that returns a prompt ends here, and the harness
+          // then runs that prompt as an ordinary turn.
+          if (success && output === `Running /${command}...`) {
+            log(`/${command} started a turn`);
+            return MOD_PROMPT_STARTED;
+          }
           if (output) {
             await cx.notify(methods.client.session.update, {
               sessionId,
@@ -1165,7 +1200,15 @@ export class LettaAcpAgent {
         log(`trace ${sessionId} ${mode}${state.cancelled ? " cancelled" : ""} ${describeSdkMessage(message)}`);
       }
       if (this.isStaleRunMessage(state, message)) continue;
-      if (message.type === "result" && message.origin !== undefined) {
+      if (
+        message.type === "result" &&
+        message.origin !== undefined &&
+        state.awaitingHarnessTurn
+      ) {
+        // The turn a mod command started is one the session did not send,
+        // so the SDK marks it as background; it is this prompt's turn.
+        state.awaitingHarnessTurn = false;
+      } else if (message.type === "result" && message.origin !== undefined) {
         // A turn the session did not send (a task notification, a cron
         // prompt) ended. Its events were shown in this prompt; the prompt's
         // own turn is still running, so keep going.
