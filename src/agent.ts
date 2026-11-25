@@ -158,6 +158,10 @@ interface AcpSessionState {
   } | null;
   /** Set by a soft cancel to make the running pump hand the turn back. */
   detachRequested?: boolean;
+  /** Prompts waiting on the prompt chain. */
+  waitingPrompts: number;
+  /** A cancel arrived for a prompt still waiting on the chain. */
+  cancelWaitingPrompt?: boolean;
   /**
    * The current prompt's message, identified by the otid it was sent with.
    * The prompt ends on the first result after the runtime dequeued it, which
@@ -803,6 +807,7 @@ export class LettaAcpAgent {
       lastToolCall: null,
       toolCalls: new Map(),
       alwaysAllowed: new Set(),
+      waitingPrompts: 0,
       cancelled: false,
       promptChain: Promise.resolve(),
       abortInFlight: null,
@@ -867,8 +872,18 @@ export class LettaAcpAgent {
     state.promptChain = new Promise<void>((resolve) => {
       release = resolve;
     });
-    await previous;
+    state.waitingPrompts += 1;
     try {
+      await previous;
+    } finally {
+      state.waitingPrompts -= 1;
+    }
+    try {
+      if (state.cancelWaitingPrompt) {
+        // Cancelled while it waited: it never reached the turn.
+        state.cancelWaitingPrompt = false;
+        return { stopReason: "cancelled" };
+      }
       return await this.runPrompt(params, state, cx);
     } finally {
       release();
@@ -1025,15 +1040,19 @@ export class LettaAcpAgent {
     const soft = state.softCancel;
     if (!soft) return;
     clearTimeout(soft.timer);
+    // Stop first, synchronously: hardCancel sets `cancelled` before its first
+    // await, so no tool permission can slip through between releasing the
+    // hold and the abort. Only the drain waits for the prompt chain.
+    const aborting = this.hardCancel(sessionId, state);
     state.softCancel = null;
-    state.detachRequested = false;
     soft.settle(false);
     const run = async () => {
       log(`no steer followed the cancel of ${sessionId}; aborting the turn`);
       // Keep the reader feeding the inbox while the abort drains.
       state.promptActive = true;
+      state.detachRequested = false;
       try {
-        await this.hardCancel(sessionId, state);
+        await aborting;
         await this.pumpStream(sessionId, state, state.clientContext, "turn");
       } catch (error) {
         log(`draining the aborted turn of ${sessionId} failed: ${String(error)}`);
@@ -1468,8 +1487,13 @@ export class LettaAcpAgent {
   async cancel(params: CancelNotification): Promise<void> {
     const state = this.sessions.get(params.sessionId);
     if (!state) return;
-    // Already detached: the grace timer decides.
-    if (state.softCancel) return;
+    // A second cancel while detached is an explicit stop: abort now, and
+    // cancel a prompt that is waiting to steer the turn.
+    if (state.softCancel) {
+      if (state.waitingPrompts > 0) state.cancelWaitingPrompt = true;
+      await this.abandonDetachedTurn(params.sessionId, state, false);
+      return;
+    }
     // A cancel may be the first half of a steer. End the ACP prompt now, so
     // the client is never kept waiting on the abort, but leave the Letta turn
     // running briefly for a prompt to join it.
