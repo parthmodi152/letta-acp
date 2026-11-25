@@ -9,7 +9,14 @@
 export class MessageInbox<T> {
   private readonly queue: T[] = [];
   private readonly waiters: Array<(value: IteratorResult<T, undefined>) => void> = [];
+  /** Ends the current waits with null, as if they had timed out. */
+  private readonly wakers = new Map<(value: IteratorResult<T, undefined>) => void, () => void>();
   private closed = false;
+
+  /** Ends every pending `next()` with null; queued messages stay queued. */
+  wake(): void {
+    for (const wake of [...this.wakers.values()]) wake();
+  }
 
   push(value: T): void {
     if (this.closed) return;
@@ -40,16 +47,19 @@ export class MessageInbox<T> {
       let timer: ReturnType<typeof setTimeout> | undefined;
       const waiter = (value: IteratorResult<T, undefined>) => {
         if (timer) clearTimeout(timer);
+        this.wakers.delete(waiter);
         resolve(value);
       };
+      const withdraw = () => {
+        if (timer) clearTimeout(timer);
+        this.wakers.delete(waiter);
+        const index = this.waiters.indexOf(waiter);
+        if (index >= 0) this.waiters.splice(index, 1);
+        resolve(null);
+      };
       this.waiters.push(waiter);
-      if (timeoutMs !== undefined) {
-        timer = setTimeout(() => {
-          const index = this.waiters.indexOf(waiter);
-          if (index >= 0) this.waiters.splice(index, 1);
-          resolve(null);
-        }, timeoutMs);
-      }
+      this.wakers.set(waiter, withdraw);
+      if (timeoutMs !== undefined) timer = setTimeout(withdraw, timeoutMs);
     });
   }
 }

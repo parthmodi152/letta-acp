@@ -40,6 +40,7 @@ import {
   type MessageContentItem,
   type PermissionMode,
   type SDKMessage,
+  type SDKQueueItem,
   type SDKResultMessage,
 } from "@letta-ai/letta-agent-sdk";
 import { authMethodsForClient } from "./auth.js";
@@ -144,6 +145,34 @@ interface AcpSessionState {
   promptActive: boolean;
   /** The prompt is waiting on a turn the harness started for a mod command. */
   awaitingHarnessTurn?: boolean;
+  /**
+   * A cancel ended the ACP prompt but the Letta turn is still running, for
+   * the steer grace period. A prompt that arrives meanwhile is queued into
+   * that turn; otherwise the timer aborts it. Tool permissions wait on `hold`
+   * (true once a prompt adopts the turn, false once it is aborted).
+   */
+  softCancel?: {
+    timer: ReturnType<typeof setTimeout>;
+    hold: Promise<boolean>;
+    settle: (adopted: boolean) => void;
+  } | null;
+  /** Set by a soft cancel to make the running pump hand the turn back. */
+  detachRequested?: boolean;
+  /**
+   * The current prompt's message, identified by the otid it was sent with.
+   * The prompt ends on the first result after the runtime dequeued it, which
+   * may be the result of a turn that was already running (a steer, or a goal
+   * continuation the message was folded into).
+   */
+  sentMessage?: {
+    otid: string;
+    /** Seen in a queue_update: it waited behind a running turn. */
+    queued: boolean;
+    /** Left the queue after being seen in it. */
+    dequeued: boolean;
+    /** Runs of the turn that was running when the message was sent. */
+    priorRunIds: Set<string>;
+  } | null;
   /** ACP session mode; enforced adapter-side in the permission callback. */
   modeId: PermissionMode;
   /** Session working directory (for project skill discovery). */
@@ -220,7 +249,9 @@ type PumpOutcome =
   /** Turn reported complete while the server still listed active runs. */
   | { kind: "premature"; result: SDKResultMessage }
   | { kind: "idle" }
-  | { kind: "stream_end" };
+  | { kind: "stream_end" }
+  /** A soft cancel took the turn away from this prompt; it keeps running. */
+  | { kind: "detached" };
 
 const IMAGE_MEDIA_TYPES = new Set([
   "image/png",
@@ -242,6 +273,7 @@ export class LettaAcpAgent {
   private readonly outOfTurnPermissionTimeoutMs: number;
   private readonly prematureResultGraceMs: number;
   private readonly cancelDrainMs: number;
+  private readonly steerGraceMs: number;
   private readonly sessionRegistry: SessionRegistry;
   private readonly sessions = new Map<string, AcpSessionState>();
   private agentIdPromise: Promise<string> | null = null;
@@ -271,6 +303,7 @@ export class LettaAcpAgent {
     this.prematureResultGraceMs =
       config.prematureResultGraceMs ?? DEFAULT_PREMATURE_RESULT_GRACE_MS;
     this.cancelDrainMs = config.cancelDrainMs ?? DEFAULT_CANCEL_DRAIN_MS;
+    this.steerGraceMs = config.steerGraceMs ?? 0;
   }
 
   /**
@@ -454,7 +487,8 @@ export class LettaAcpAgent {
   async closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
     const state = this.sessions.get(params.sessionId);
     if (!state) return {};
-    if (state.promptActive) await this.cancel({ sessionId: params.sessionId });
+    if (state.softCancel) await this.abandonDetachedTurn(params.sessionId, state, false);
+    else if (state.promptActive) await this.hardCancel(params.sessionId, state);
     this.sessions.delete(params.sessionId);
     state.session.close();
     log(`closed session ${params.sessionId}`);
@@ -822,6 +856,9 @@ export class LettaAcpAgent {
     if (!state) {
       throw new Error(`Unknown session: ${params.sessionId}`);
     }
+    // A prompt arrived within the steer grace period: it decides what happens
+    // to the detached turn, so the abort timer must not fire meanwhile.
+    if (state.softCancel) clearTimeout(state.softCancel.timer);
     // One prompt at a time per session: a prompt that arrives while a
     // cancelled one is still draining its turn waits for it, so the two can
     // never read each other's events from the shared SDK stream.
@@ -844,22 +881,53 @@ export class LettaAcpAgent {
     cx: AgentContext,
   ): Promise<PromptResponse> {
     state.clientContext = cx;
+    // A prompt right after a soft cancel is a steer: queue it into the turn
+    // that is still running. Commands and attachments cannot join a running
+    // turn, so for those the turn is aborted first, as before.
+    let steering = false;
+    if (state.softCancel) {
+      if (isSteerablePrompt(params)) {
+        this.adoptDetachedTurn(state);
+        steering = true;
+      } else {
+        await this.abandonDetachedTurn(params.sessionId, state, true);
+      }
+    }
     // A steer (cancel, then an immediate new prompt) must not send before the
     // server has processed the abort: aborting clears the server's input
     // queue, which would silently drop the new message.
     if (state.abortInFlight) await state.abortInFlight;
     state.cancelled = false;
     state.promptActive = true;
-    state.turnRunIds = new Set();
+    state.sentMessage = null;
+    let detached = false;
+    // A steered prompt continues the running turn, whose runs stay this
+    // prompt's.
+    if (!steering) state.turnRunIds = new Set();
 
     try {
-      const commandResponse = await this.maybeRunCommand(params, state, cx);
+      const commandResponse = steering
+        ? null
+        : await this.maybeRunCommand(params, state, cx);
       if (commandResponse && commandResponse !== MOD_PROMPT_STARTED) {
         return commandResponse;
       }
       // A mod command that returns a prompt has already started its turn.
       state.awaitingHarnessTurn = commandResponse === MOD_PROMPT_STARTED;
-      if (!commandResponse) await state.session.send(toLettaContent(params.prompt));
+      if (!commandResponse) {
+        const otid = crypto.randomUUID();
+        state.sentMessage = {
+          otid,
+          queued: false,
+          dequeued: false,
+          priorRunIds: new Set(state.turnRunIds),
+        };
+        await state.session.send(toLettaContent(params.prompt), { otid });
+        if (steering) {
+          log(`steer: queued the new prompt into the running turn`);
+          await this.reannounceToolCalls(params.sessionId, state, cx);
+        }
+      }
       // The Letta app-server transport completes a turn with a recoverable
       // "approval_conflict" result whenever a tool needs user approval. The
       // approval itself resolves concurrently: the server sends a
@@ -878,6 +946,10 @@ export class LettaAcpAgent {
           mode,
           graceMs,
         );
+        if (outcome.kind === "detached") {
+          detached = true;
+          return { stopReason: "cancelled" };
+        }
         if (state.cancelled) return { stopReason: "cancelled" };
         switch (outcome.kind) {
           case "premature": {
@@ -917,11 +989,106 @@ export class LettaAcpAgent {
       // in-a-turn marker is cleared, so late tool traffic still reaches the
       // client but waits on a deadline.
       state.promptActive = false;
-      // Whatever arrived after the turn's result belongs to no prompt now.
-      for (const message of state.inbox.drain()) {
-        await this.forwardOutOfTurn(params.sessionId, state, message);
+      // A detached turn is still running: its messages stay in the inbox for
+      // the prompt that steers it, or for the abort's drain.
+      if (!detached) {
+        state.sentMessage = null;
+        // Whatever arrived after the turn's result belongs to no prompt now.
+        for (const message of state.inbox.drain()) {
+          await this.forwardOutOfTurn(params.sessionId, state, message);
+        }
       }
     }
+  }
+
+  /** Takes over a soft-cancelled turn for a steering prompt. */
+  private adoptDetachedTurn(state: AcpSessionState): void {
+    const soft = state.softCancel;
+    if (!soft) return;
+    clearTimeout(soft.timer);
+    state.softCancel = null;
+    state.detachRequested = false;
+    soft.settle(true);
+  }
+
+  /**
+   * Aborts a soft-cancelled turn: no steer followed the cancel, or the next
+   * prompt cannot be queued into it. Tool calls held meanwhile are denied,
+   * and the aborted turn is drained so its result is not taken for the next
+   * prompt's. `locked` means the caller already holds the prompt chain.
+   */
+  private async abandonDetachedTurn(
+    sessionId: string,
+    state: AcpSessionState,
+    locked: boolean,
+  ): Promise<void> {
+    const soft = state.softCancel;
+    if (!soft) return;
+    clearTimeout(soft.timer);
+    state.softCancel = null;
+    state.detachRequested = false;
+    soft.settle(false);
+    const run = async () => {
+      log(`no steer followed the cancel of ${sessionId}; aborting the turn`);
+      // Keep the reader feeding the inbox while the abort drains.
+      state.promptActive = true;
+      try {
+        await this.hardCancel(sessionId, state);
+        await this.pumpStream(sessionId, state, state.clientContext, "turn");
+      } catch (error) {
+        log(`draining the aborted turn of ${sessionId} failed: ${String(error)}`);
+      } finally {
+        state.promptActive = false;
+        state.sentMessage = null;
+        for (const message of state.inbox.drain()) {
+          await this.forwardOutOfTurn(sessionId, state, message);
+        }
+      }
+    };
+    if (locked) return run();
+    const previous = state.promptChain;
+    let release!: () => void;
+    state.promptChain = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      await run();
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * A steering prompt is a new ACP turn, and the client closed the tool
+   * cards of the cancelled one. Tool calls still running are announced again
+   * so their results have a card to land on.
+   */
+  private async reannounceToolCalls(
+    sessionId: string,
+    state: AcpSessionState,
+    cx: AgentContext,
+  ): Promise<void> {
+    for (const [toolCallId, call] of state.toolCalls) {
+      await cx.notify(methods.client.session.update, {
+        sessionId,
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId,
+          title: toolTitle(call.toolName, call.input.input),
+          kind: toolKind(call.toolName),
+          status: "in_progress",
+        },
+      });
+    }
+  }
+
+  /** Records whether the prompt's message is waiting in the runtime's queue. */
+  private trackSentMessage(state: AcpSessionState, queue: readonly SDKQueueItem[]): void {
+    const sent = state.sentMessage;
+    if (!sent) return;
+    if (queue.some((item) => item.clientMessageId === sent.otid)) sent.queued = true;
+    else if (sent.queued) sent.dequeued = true;
   }
 
   /**
@@ -1109,7 +1276,7 @@ export class LettaAcpAgent {
           let received = false;
           for await (const message of state.session.stream()) {
             received = true;
-            if (state.promptActive) state.inbox.push(message);
+            if (state.promptActive || state.softCancel) state.inbox.push(message);
             else await this.forwardOutOfTurn(sessionId, state, message);
           }
           // An empty stream means the SDK session closed.
@@ -1171,6 +1338,8 @@ export class LettaAcpAgent {
     // terminal result before giving up on it.
     let cancelDrainUntil: number | undefined;
     while (true) {
+      // A soft cancel hands the running turn back; its messages stay queued.
+      if (state.detachRequested && !state.cancelled) return { kind: "detached" };
       // Only the first message of a grace round is raced: a server that went
       // quiet after contradicting itself must not wedge the prompt.
       const deadlineMs =
@@ -1180,6 +1349,7 @@ export class LettaAcpAgent {
             ? firstMessageDeadlineMs
             : undefined;
       const step = await state.inbox.next(deadlineMs);
+      if (!step && state.detachRequested && !state.cancelled) return { kind: "detached" };
       if (!step) {
         if (cancelDrainUntil !== undefined) {
           // The aborted turn's result may still arrive; make sure it cannot
@@ -1200,7 +1370,26 @@ export class LettaAcpAgent {
         log(`trace ${sessionId} ${mode}${state.cancelled ? " cancelled" : ""} ${describeSdkMessage(message)}`);
       }
       if (this.isStaleRunMessage(state, message)) continue;
-      if (
+      if (message.type === "queue_update") this.trackSentMessage(state, message.queue);
+      const sent = state.cancelled ? null : state.sentMessage;
+      if (message.type === "result" && sent) {
+        // The turn that was running when the prompt's message was sent ended
+        // before taking the message in: the message starts a turn of its own,
+        // and that turn's result is the prompt's.
+        const priorTurn = sent.queued
+          ? !sent.dequeued
+          : (message.runIds ?? []).some((runId) => sent.priorRunIds.has(runId));
+        if (priorTurn) {
+          log("the running turn ended before reading the new message; waiting for its turn");
+          for (const runId of messageRunIds(message)) sent.priorRunIds.add(runId);
+          continue;
+        }
+      }
+      if (message.type === "result" && message.origin !== undefined && sent?.dequeued) {
+        // The message was folded into a turn the session did not start (a
+        // goal continuation, a task notification): that turn answered it.
+        log(`the prompt's message was answered inside a ${message.origin} turn`);
+      } else if (
         message.type === "result" &&
         message.origin !== undefined &&
         state.awaitingHarnessTurn
@@ -1279,6 +1468,37 @@ export class LettaAcpAgent {
   async cancel(params: CancelNotification): Promise<void> {
     const state = this.sessions.get(params.sessionId);
     if (!state) return;
+    // Already detached: the grace timer decides.
+    if (state.softCancel) return;
+    // A cancel may be the first half of a steer. End the ACP prompt now, so
+    // the client is never kept waiting on the abort, but leave the Letta turn
+    // running briefly for a prompt to join it.
+    if (
+      this.steerGraceMs > 0 &&
+      state.promptActive &&
+      !state.cancelled &&
+      state.sentMessage &&
+      !state.awaitingHarnessTurn
+    ) {
+      let settle!: (adopted: boolean) => void;
+      const hold = new Promise<boolean>((resolve) => {
+        settle = resolve;
+      });
+      const timer = setTimeout(() => {
+        void this.abandonDetachedTurn(params.sessionId, state, false);
+      }, this.steerGraceMs);
+      state.softCancel = { timer, hold, settle };
+      state.detachRequested = true;
+      state.inbox.wake();
+      log(`cancel of ${params.sessionId}: keeping the turn ${this.steerGraceMs}ms for a steer`);
+      return;
+    }
+    await this.hardCancel(params.sessionId, state);
+  }
+
+  /** Aborts the running turn on the server. */
+  private async hardCancel(sessionId: string, state: AcpSessionState): Promise<void> {
+    const params = { sessionId };
     state.cancelled = true;
     // Interrupted tool calls never produce a tool_result, so drop their
     // accumulated arguments here instead of leaking them for the session.
@@ -1831,6 +2051,19 @@ export class LettaAcpAgent {
         message: "Unknown ACP session",
       };
     }
+    if (state.softCancel) {
+      // Between a cancel and the steer that may follow, nothing new runs:
+      // with no steer, the cancel was a stop.
+      log(`holding ${toolName} until the steer grace period ends`);
+      if (!(await state.softCancel.hold)) {
+        log(`denying ${toolName}: prompt turn was cancelled`);
+        return {
+          behavior: "deny",
+          message: "Prompt turn was cancelled",
+          interrupt: true,
+        };
+      }
+    }
     if (state.cancelled) {
       // The client context now outlives the turn, so nothing else stops a
       // request that raced session/abort from prompting the user again after
@@ -2111,6 +2344,17 @@ export function toSdkMcpServers(
     log(`MCP server "${server.name}" skipped: ACP transport is not supported`);
   }
   return Object.fromEntries(configs);
+}
+
+/**
+ * Whether a prompt can be queued into a running turn: plain text that is not
+ * a slash command. Commands run in the adapter or the harness, not the turn.
+ */
+export function isSteerablePrompt(params: PromptRequest): boolean {
+  if (params.prompt.length === 0) return false;
+  if (!params.prompt.every((block) => block.type === "text")) return false;
+  const first = params.prompt[0];
+  return !(first?.type === "text" && first.text.trimStart().startsWith("/"));
 }
 
 /** ACP prompt content blocks -> Letta multimodal message content. */

@@ -45,6 +45,17 @@ export interface LettaAcpConfig {
    * result once the server reports idle. Defaults to 5 seconds.
    */
   cancelDrainMs?: number;
+  /**
+   * Steering. Clients such as T3 Code steer by cancelling the running prompt
+   * and sending the new message right away. With a grace period, a cancel
+   * ends the ACP prompt at once but keeps the Letta turn running; a prompt
+   * that follows within the grace period is queued into that turn, which reads
+   * it at its next step. With no follow-up, the turn is aborted, and tool
+   * calls it attempts meanwhile are denied. 0 (the default when unset in code)
+   * aborts at once; configFromEnv defaults to 3000 ms
+   * (LETTA_ACP_STEER_GRACE_MS).
+   */
+  steerGraceMs?: number;
 }
 
 const PERMISSION_MODES: PermissionMode[] = [
@@ -138,9 +149,18 @@ export function configFromEnv(
     );
   }
 
+  const steerGraceRaw = env.LETTA_ACP_STEER_GRACE_MS?.trim();
+  const steerGraceMs = steerGraceRaw ? Number(steerGraceRaw) : 3000;
+  if (!Number.isFinite(steerGraceMs) || steerGraceMs < 0) {
+    throw new Error(
+      `Invalid LETTA_ACP_STEER_GRACE_MS "${env.LETTA_ACP_STEER_GRACE_MS}" (expected milliseconds, 0 to disable)`,
+    );
+  }
+
   return {
     clientOptions,
     imageLinks,
+    steerGraceMs,
     agentId: env.LETTA_AGENT_ID,
     model: env.LETTA_ACP_MODEL,
     permissionMode: permissionMode as PermissionMode,
